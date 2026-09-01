@@ -1,0 +1,10 @@
+*.log
+.env
+.env.local
+.next/
+data/logs/
+data/research/
+data/tmp/
+node_modules/
+web/.env.local
+.omc/

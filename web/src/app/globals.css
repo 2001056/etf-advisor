@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard",
+    system-ui, sans-serif;
+}
+
+html {
+  font-family: var(--font-sans);
+}

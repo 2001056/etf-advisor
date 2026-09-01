@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "etf-advisor",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "web", "dev"],
+      "port": 3111,
+      "autoPort": true
+    }
+  ]
+}
