@@ -13,15 +13,26 @@ import {
   parseResearchDoc,
   tickersOf,
 } from "@/domain/docFormat";
-import { dateKeyKST, monthKeyKST, CATEGORIES, Category } from "@/domain/money";
+import {
+  dateKeyKST,
+  isMarketOpenKST,
+  monthKeyKST,
+  CATEGORIES,
+  Category,
+} from "@/domain/money";
 import { getBalances } from "@/domain/ledger";
 import { getHoldings } from "@/domain/purchases";
 // JSON 추출·정수 변환·pick 정규화는 순수 로직이라 분리했다.
 // 회귀 테스트: scripts/check-recommend.ts
-import { extractJson, normalizePicks } from "@/domain/recommendation";
+import {
+  applyRealtimePrices,
+  extractJson,
+  normalizePicks,
+} from "@/domain/recommendation";
 import { getPrompt } from "@/domain/prompts";
 import { checkDocument, issuesToProblems } from "@/domain/dataChecks";
 import { checkCodexAuth, runCodex, tailLog } from "./codex";
+import { getRealtimePrices } from "./livePrice";
 import { researchPath } from "./paths";
 import { notify } from "./notify";
 import { runHoldingWatch } from "./watch";
@@ -371,15 +382,31 @@ export async function tickersToResearch(): Promise<string[]> {
   return [...new Set([...fromDocs, ...held.map((h) => h.ticker)])].filter(Boolean);
 }
 
+export type RecommendFlowResult = {
+  actionId: string;
+  researchRunId: number;
+  recommendRunId: number | null;
+};
+
+export const MARKET_CLOSED_MESSAGE =
+  "장 운영시간(평일 09:00~15:30)이 아닙니다 — 지금 조사한 가격으로는 살 수 없어 내일 가격과 달라집니다";
+
+/**
+ * 장마감 가드는 흐름의 입구에서 한 번만 판정한다 — 화면·스크립트가 늘어도 빠지지 않게.
+ * 막히면 { blocked }, 시작하면 { started }(30분까지 걸리는 promise)를 준다.
+ */
+export function runRecommendFlow(
+  opts: { force?: boolean } = {},
+): { blocked: string } | { started: Promise<RecommendFlowResult> } {
+  if (!opts.force && !isMarketOpenKST()) return { blocked: MARKET_CLOSED_MESSAGE };
+  return { started: recommendFlow() };
+}
+
 /**
  * "매입 추천" 액션: ② 조사 → ③ 추천을 한 흐름으로 (§5.3).
  * 같은 action_id로 묶여 UI에서 하나의 진행 상태로 보인다.
  */
-export async function runRecommendFlow(): Promise<{
-  actionId: string;
-  researchRunId: number;
-  recommendRunId: number | null;
-}> {
+async function recommendFlow(): Promise<RecommendFlowResult> {
   const actionId = `act-${Date.now()}`;
   const tickers = await tickersToResearch();
 
@@ -525,7 +552,21 @@ export async function runRecommendFlow(): Promise<{
       })),
     });
 
-    const rows = normalized.map((r) => ({ ...r, runId: run.id, month }));
+    // 조사 문서의 가격은 이미 묵은 값이다. 증권사 앱과 같은 값으로 사려면
+    // 추천 시점의 체결가로 기준가를 갈아끼우고 수량을 다시 센다 (원값은 researchPrice에).
+    const quoteTickers = [
+      ...new Set(
+        normalized
+          .flatMap((r) => [r.ticker, r.sellTicker])
+          .filter((t): t is string => Boolean(t)),
+      ),
+    ];
+    const priced = applyRealtimePrices(
+      normalized,
+      quoteTickers.length ? await getRealtimePrices(quoteTickers) : new Map(),
+    );
+
+    const rows = priced.rows.map((r) => ({ ...r, runId: run.id, month }));
 
     // insert 실패가 15분짜리 실행 전체를 날리지 않게 분리한다
     let insertError: string | null = null;
@@ -539,6 +580,10 @@ export async function runRecommendFlow(): Promise<{
     }
 
     const notes = [
+      priced.eligible
+        ? `실시간가 적용 ${priced.applied}/${priced.eligible}건` +
+          (priced.excluded.length ? ` (제외 사유: ${priced.excluded.join(", ")})` : "")
+        : "",
       dropped.length ? `버려진 추천 ${dropped.length}건:\n- ${dropped.join("\n- ")}` : "",
       rows.length === 0 ? `유효한 추천이 없습니다. 원본:\n${res.output.slice(0, 1500)}` : "",
       insertError ?? "",

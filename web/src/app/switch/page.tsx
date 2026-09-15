@@ -5,6 +5,7 @@ import { tickerCandidates } from "@/domain/tickers";
 import { CATEGORY_LABEL, Category, dateKeyKST } from "@/domain/money";
 import { Card, Page } from "@/components/ui";
 import SwitchForm from "./form";
+import CancelSwitchButton from "./cancel";
 
 export const dynamic = "force-dynamic";
 
@@ -69,9 +70,15 @@ export default async function SwitchPage() {
                     </td>
                     <td>
                       {s.switchGroupId ? (
-                        <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-800">
-                          갈아타기
-                        </span>
+                        <>
+                          <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-800">
+                            갈아타기
+                          </span>
+                          <CancelSwitchButton
+                            groupId={s.switchGroupId}
+                            summary={`${s.soldAt} ${s.etfName}(${s.ticker}) ${s.qty}주 매도로 시작한`}
+                          />
+                        </>
                       ) : (
                         <span className="text-xs text-neutral-400">단독</span>
                       )}

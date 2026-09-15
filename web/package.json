@@ -22,9 +22,13 @@
     "check:official": "tsx --env-file=.env.local scripts/check-official.ts",
     "check:xirr": "tsx scripts/check-xirr.ts",
     "check:twr": "tsx scripts/check-twr.ts",
+    "check:perf-transfer": "tsx scripts/check-perf-transfer.ts",
     "check:drift": "tsx scripts/check-drift.ts",
     "check:watch": "tsx scripts/check-watch.ts",
-    "check:consolidate": "tsx scripts/check-consolidate.ts"
+    "check:consolidate": "tsx scripts/check-consolidate.ts",
+    "check:accept": "tsx scripts/check-accept.ts",
+    "check:switch": "tsx scripts/check-switch.ts",
+    "check:purchase-guard": "tsx scripts/check-purchase-guard.ts"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.1.0",

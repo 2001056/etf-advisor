@@ -32,6 +32,16 @@ export default function AcceptForm({
     null,
   );
 
+  // 1주도 못 사는데 폼을 그리면 기본값이 없는 수량을 채워 넣게 된다.
+  // 갈아타기 경로에는 잔액 검증이 없어 그대로 원장이 음수가 된다.
+  if (defaultQty <= 0) {
+    return (
+      <p className="mt-3 border-t border-neutral-100 pt-3 text-sm text-amber-700">
+        지금 시세로는 배정액으로 1주도 살 수 없습니다 — 기록할 수량이 없습니다.
+      </p>
+    );
+  }
+
   if (state?.ok) {
     return (
       <p className="mt-3 text-sm text-green-700">
@@ -60,7 +70,7 @@ export default function AcceptForm({
               type="number"
               min={1}
               required
-              defaultValue={sellDefaultQty || 1}
+              defaultValue={sellDefaultQty ?? undefined}
               className={`${inputClass} w-24`}
             />
           </div>
@@ -88,7 +98,7 @@ export default function AcceptForm({
           type="number"
           min={1}
           required
-          defaultValue={defaultQty || 1}
+          defaultValue={defaultQty}
           className={`${inputClass} w-24`}
         />
       </div>

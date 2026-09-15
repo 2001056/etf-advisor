@@ -22,6 +22,7 @@ export default function Runner({ busyAtLoad }: { busyAtLoad: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<Status | null>(null);
   const [watching, setWatching] = useState(busyAtLoad);
+  const [force, setForce] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
@@ -59,7 +60,7 @@ export default function Runner({ busyAtLoad }: { busyAtLoad: boolean }) {
     setError(null);
     setWatching(true);
     startTransition(async () => {
-      const res = await startRecommendAction();
+      const res = await startRecommendAction(force);
       if (res?.error) {
         setError(res.error);
         setWatching(false);
@@ -77,6 +78,23 @@ export default function Runner({ busyAtLoad }: { busyAtLoad: boolean }) {
       <button onClick={start} disabled={busy} className={buttonClass}>
         {busy ? "실행 중…" : "매입 추천 받기"}
       </button>
+
+      <div className="space-y-1">
+        <label className="flex items-center gap-2 text-sm text-neutral-700">
+          <input
+            type="checkbox"
+            checked={force}
+            onChange={(e) => setForce(e.target.checked)}
+            disabled={busy}
+            className="h-4 w-4"
+          />
+          장 운영시간이 아니어도 그래도 실행
+        </label>
+        <p className="text-xs text-neutral-500">
+          평일 09:00~15:30(KST) 밖에서는 기본으로 막습니다. 공휴일은 판별하지
+          않으므로 휴장일에는 막히지 않습니다.
+        </p>
+      </div>
 
       {busy && (
         <div className="space-y-2">

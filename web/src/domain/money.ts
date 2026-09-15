@@ -33,6 +33,28 @@ export function dateKeyKST(d: Date = new Date()): string {
   }).format(d);
 }
 
+/**
+ * KRX 정규장(평일 09:00~15:30, KST) 안인지.
+ * 공휴일은 판별하지 않는다 — 휴장일에도 true가 나올 수 있다.
+ */
+export function isMarketOpenKST(d: Date = new Date()): boolean {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Seoul",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(d);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+
+  const weekday = get("weekday");
+  if (weekday === "Sat" || weekday === "Sun") return false;
+
+  const minutes = Number(get("hour")) * 60 + Number(get("minute"));
+  if (!Number.isFinite(minutes)) return false;
+  return minutes >= 9 * 60 && minutes <= 15 * 60 + 30;
+}
+
 /** "2026-08" → "2026-09" */
 export function nextMonth(month: string): string {
   const [y, m] = month.split("-").map(Number);

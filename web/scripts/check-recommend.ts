@@ -4,12 +4,15 @@
  */
 import {
   allocateBudgets,
+  applyRealtimePrices,
+  computeRefQty,
   extractJson,
+  isDrift,
   normalizePicks,
   positiveInt,
   toInt,
 } from "../src/domain/recommendation";
-import { Category } from "../src/domain/money";
+import { Category, isMarketOpenKST } from "../src/domain/money";
 
 let failed = 0;
 function check(label: string, actual: unknown, expected: unknown) {
@@ -288,6 +291,162 @@ const tooPricey = normalizePicks(
 );
 check("가격 > 잔액이면 skip", tooPricey.rows[0].skipped, true);
 check("수량 0", tooPricey.rows[0].refQty, 0);
+
+console.log("\n=== 기준가를 실시간 체결가로 교체 ===");
+const pricedAt = new Date("2026-09-15T15:24:00+09:00");
+// 고배당을 건너뛰어 재배분된다 — 배당성장 배정액은 437,500원(350,000 + 140,000×5/8)
+const base = normalizePicks(
+  {
+    picks: [
+      { category: "배당성장", action: "buy", ticker: "446720", etf_name: "A", ref_price: 14_000, ref_qty: 25, rationale: "", source_doc_ids: [], source_urls: [] },
+      { category: "자산성장", action: "buy", ticker: "133690", etf_name: "B", ref_price: 21_000, ref_qty: 10, rationale: "", source_doc_ids: [], source_urls: [] },
+      { category: "고배당", action: "skip", ticker: null, etf_name: null, ref_price: null, ref_qty: 0, rationale: "", source_doc_ids: [], source_urls: [] },
+    ],
+  },
+  ctx,
+).rows;
+check("교체 전 배당성장 수량", base[0].refQty, 31);
+check("교체 전 출처는 조사", base[0].priceSource, "research");
+
+const swapped = applyRealtimePrices(
+  base,
+  new Map([["446720", { price: 12_500, pricedAt }]]),
+).rows;
+check("실시간가로 교체", swapped[0].refPrice, 12_500);
+check("수량 재계산 floor(437500/12500)", swapped[0].refQty, 35);
+check("조사 가격은 남는다", swapped[0].researchPrice, 14_000);
+check("출처는 실시간", swapped[0].priceSource, "realtime");
+check("기준 시각 기록", swapped[0].pricedAt?.toISOString(), pricedAt.toISOString());
+check("실시간가 없는 종목은 조사가 유지", swapped[1].refPrice, 21_000);
+check("  수량도 그대로", swapped[1].refQty, 12);
+check("  출처도 조사 그대로", swapped[1].priceSource, "research");
+check("  기준 시각 없음", swapped[1].pricedAt, null);
+check("skip은 null 유지", swapped[2].refPrice, null);
+check("  skip 출처도 조사", swapped[2].priceSource, "research");
+check("  skip 수량 0", swapped[2].refQty, 0);
+
+console.log("\n=== 대조군: 실시간가 = 조사가면 수량이 안 바뀐다 ===");
+const same = applyRealtimePrices(
+  base,
+  new Map([["446720", { price: 14_000, pricedAt }]]),
+).rows;
+check("가격 동일", same[0].refPrice, 14_000);
+check("수량 불변", same[0].refQty, 31);
+check("출처만 실시간으로", same[0].priceSource, "realtime");
+
+console.log("\n=== 갈아타기도 매도가를 실시간으로 ===");
+const sw = normalizePicks(
+  {
+    picks: [
+      { category: "고배당", action: "switch", ticker: "490600", etf_name: "C", ref_price: 10_000, ref_qty: 0, sell_ticker: "458730", sell_qty: 10, sell_ref_price: 14_000, rationale: "", source_doc_ids: [], source_urls: [] },
+    ],
+  },
+  { ...ctx, holdings: [{ category: "high_div" as Category, ticker: "458730", qty: 10 }] },
+).rows;
+check("교체 전 수량 floor((140000+140000)/10000)", sw[0].refQty, 28);
+const swPriced = applyRealtimePrices(
+  sw,
+  new Map([
+    ["490600", { price: 11_000, pricedAt }],
+    ["458730", { price: 15_000, pricedAt }],
+  ]),
+).rows;
+check("매도가 교체", swPriced[0].sellRefPrice, 15_000);
+check("매도 조사가 보존", swPriced[0].sellResearchPrice, 14_000);
+check("수량 floor((140000+150000)/11000)", swPriced[0].refQty, 26);
+
+console.log("\n=== 매도 다리만 실시간이어도 출처는 실시간 ===");
+const sellOnly = applyRealtimePrices(
+  sw,
+  new Map([["458730", { price: 15_000, pricedAt }]]),
+);
+check("매수가는 조사가 그대로", sellOnly.rows[0].refPrice, 10_000);
+check("매도가만 교체", sellOnly.rows[0].sellRefPrice, 15_000);
+check("출처는 실시간", sellOnly.rows[0].priceSource, "realtime");
+check("기준 시각 채움", sellOnly.rows[0].pricedAt?.toISOString(), pricedAt.toISOString());
+check("수량 floor((140000+150000)/10000)", sellOnly.rows[0].refQty, 29);
+check("적용 1/1", [sellOnly.applied, sellOnly.eligible], [1, 1]);
+
+console.log("\n=== 실시간가로 0주가 되면 교체하지 않는다 (skipped=false ∧ 수량 0 금지) ===");
+const tinyCtx = {
+  balances: { div_growth: 15_000, asset_growth: 0, high_div: 0 } as Record<Category, number>,
+  injectedDocIds: [],
+};
+const tiny = normalizePicks(
+  {
+    picks: [
+      { category: "배당성장", action: "buy", ticker: "446720", etf_name: "A", ref_price: 14_000, ref_qty: 1, rationale: "", source_doc_ids: [], source_urls: [] },
+    ],
+  },
+  tinyCtx,
+).rows;
+check("교체 전 1주", tiny[0].refQty, 1);
+const raised = applyRealtimePrices(
+  tiny,
+  new Map([["446720", { price: 16_000, pricedAt }]]),
+);
+check("조사가 유지", raised.rows[0].refPrice, 14_000);
+check("조사 수량 유지", raised.rows[0].refQty, 1);
+check("출처는 조사 그대로", raised.rows[0].priceSource, "research");
+check("기준 시각 없음", raised.rows[0].pricedAt, null);
+check("건너뜀 아님(원래대로)", raised.rows[0].skipped, false);
+check("적용 0/1", [raised.applied, raised.eligible], [0, 1]);
+check("제외 사유 기록", raised.excluded[0]?.includes("1주도 못 사서"), true);
+
+console.log("\n=== 대조군: 이미 건너뛴 행은 가격이 떨어져도 되살아나지 않는다 ===");
+const revived = applyRealtimePrices(
+  tooPricey.rows,
+  new Map([["490600", { price: 5_000, pricedAt }]]),
+);
+check("건너뜀 유지", revived.rows[0].skipped, true);
+check("수량 0 유지", revived.rows[0].refQty, 0);
+check("가격 null 유지", revived.rows[0].refPrice, null);
+check("출처도 조사", revived.rows[0].priceSource, "research");
+check("대상 자체가 아님", revived.eligible, 0);
+
+console.log("\n=== 실시간가 위생: 조사가에서 30% 넘게 벌어지면 안 쓴다 ===");
+const insane = applyRealtimePrices(
+  base,
+  new Map([["446720", { price: 20_000, pricedAt }]]),
+);
+check("조사가 유지", insane.rows[0].refPrice, 14_000);
+check("수량 유지", insane.rows[0].refQty, 31);
+check("출처는 조사", insane.rows[0].priceSource, "research");
+check("제외 사유 기록", insane.excluded[0]?.includes("30%"), true);
+// 경계 바로 안쪽(+30%)은 그대로 쓴다
+const edge = applyRealtimePrices(
+  base,
+  new Map([["446720", { price: 18_200, pricedAt }]]),
+);
+check("정확히 +30%는 적용", edge.rows[0].refPrice, 18_200);
+check("  출처도 실시간", edge.rows[0].priceSource, "realtime");
+
+console.log("\n=== isDrift 경계 (화면 경로도 같은 함수를 쓴다) ===");
+check("+29%는 통과", isDrift(12_900, 10_000), false);
+check("+31%는 드리프트", isDrift(13_100, 10_000), true);
+check("−29%는 통과", isDrift(7_100, 10_000), false);
+check("−31%는 드리프트", isDrift(6_900, 10_000), true);
+check("조사가 없으면 판정 불가", isDrift(99_999, null), false);
+
+console.log("\n=== computeRefQty 경계 ===");
+check("정확히 나누어떨어짐", computeRefQty(140_000, 0, 14_000), 10);
+check("1원 모자람", computeRefQty(13_999, 0, 14_000), 0);
+check("딱 1주", computeRefQty(14_000, 0, 14_000), 1);
+check("매도대금 합산해서 딱 떨어짐", computeRefQty(50, 50, 100), 1);
+check("배정 0", computeRefQty(0, 0, 100), 0);
+check("가격 0은 0주", computeRefQty(100_000, 0, 0), 0);
+
+console.log("\n=== 장 운영시간 가드 (KST, 공휴일 미판별) ===");
+check("평일 10:00", isMarketOpenKST(new Date("2026-09-15T10:00:00+09:00")), true);
+check("평일 15:30", isMarketOpenKST(new Date("2026-09-15T15:30:00+09:00")), true);
+check("평일 15:31", isMarketOpenKST(new Date("2026-09-15T15:31:00+09:00")), false);
+check("평일 08:59", isMarketOpenKST(new Date("2026-09-15T08:59:00+09:00")), false);
+check("평일 09:00", isMarketOpenKST(new Date("2026-09-15T09:00:00+09:00")), true);
+check("토요일 11:00", isMarketOpenKST(new Date("2026-09-19T11:00:00+09:00")), false);
+check("일요일 11:00", isMarketOpenKST(new Date("2026-09-20T11:00:00+09:00")), false);
+// UTC로 들어와도 KST로 환산해서 본다 — 2026-09-15 01:00Z = KST 10:00
+check("UTC 입력도 KST 기준", isMarketOpenKST(new Date("2026-09-15T01:00:00Z")), true);
+check("KST 자정", isMarketOpenKST(new Date("2026-09-15T00:00:00+09:00")), false);
 
 console.log(`\n=== 결과: ${failed === 0 ? "전부 통과" : `${failed}건 실패`} ===`);
 process.exit(failed === 0 ? 0 : 1);

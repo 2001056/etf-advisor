@@ -2,7 +2,7 @@
 
 월간 ETF 적립 매수 도우미 (1인용, 맥북 자체 호스팅). 설계는 [기획서.md](기획서.md).
 
-**접속**: http://192.168.0.2:3111 (같은 와이파이의 폰·PC에서도)
+**접속**: http://192.168.0.197:3111 (같은 와이파이의 폰·PC에서도)
 
 ## 구성
 
@@ -12,6 +12,7 @@
 | `scripts/run-agent.sh` | launchd에서 codex를 찾게 해주는 PATH 래퍼 |
 | `scripts/start-web.sh` | 앱 상주 실행 |
 | `scripts/trigger-research.sh` | 정기 조사 트리거 (재시도 3회) |
+| `scripts/trigger-prices.sh` | 가격 적재 + 월 충전 트리거 (재시도 3회) |
 | `data/research/` | 조사 md 로컬 사본 |
 | `data/logs/` | 실행 로그 |
 
@@ -25,6 +26,7 @@ DB는 도커 Postgres 16 컨테이너 `etf-advisor-db` (127.0.0.1:5433, `restart
 | `com.etf-advisor.research` | 월·목 07:30 정기 조사 트리거 |
 | `com.etf-advisor.watch` | 매일 13:00 보유 점검 트리거 |
 | `com.etf-advisor.consolidate` | 매월 1일 13:30 종목 정리 검토 트리거 |
+| `com.etf-advisor.prices` | 매일 16:00 (장 마감 후) 가격 이력 적재 + 월 충전 |
 | `com.etf-advisor.docker` | 로그인 시 + 5분마다 colima·DB 확인 (절전 복구) |
 
 ```bash
@@ -39,7 +41,11 @@ launchctl kickstart -k gui/$UID/com.etf-advisor.web   # 앱 재시작
 
 1. **정기 조사** — 월/목 07:30 자동. 시장·후보 ETF 조사 → 표준 형식 문서로 저장
 2. **매입 시점 조사** — "매입 추천" 버튼. 문서에 등장한 종목 + 보유 종목 **전체**를 같은 시점 기준으로 재조사
-3. **추천** — 조사 결과 + 카테고리별 잔액으로 종목 선정
+3. **추천** — 조사 결과 + 카테고리별 잔액으로 종목 선정.
+   기준가는 조사 문서 값이 아니라 **추천 시점의 실시간 체결가**(네이버 폴링, 증권사 앱과 같은 KRX 값)로
+   갈아끼우고 수량을 다시 센다 — 조사 가격은 `research_price`에 남는다.
+   "매입 추천" 버튼은 **평일 09:00~15:30(KST) 밖이면 막는다**(체크박스로 강행 가능, 공휴일은 판별하지 않음) —
+   장이 닫힌 뒤 받은 추천은 내일 가격과 달라 그대로 살 수 없기 때문이다.
 4. **보유 점검** — **매일 13:00 자동**. 보유 종목이 위험해졌는지 살피고, 위험하면 매도·대체 종목까지 제안
 5. **종목 정리 검토** — **매월 1일 13:30 자동**. 같은 카테고리에 쌓인 ETF들이 실질적으로 같은 걸
    사고 있으면 하나로 모으는 안을 제안. 팔지 않고 **신규 매수만 한쪽으로 모으는 대안**을 반드시 함께 제시
@@ -83,8 +89,11 @@ pnpm --dir web run prompts:load ~/Documents/Codex/2026-08-27/new-chat/outputs/et
 연환산 수익률을 **절반 수준으로 과소표시**한다(12개월 적립 예시: 7.14% vs XIRR 14.82%).
 그래서 헤드라인은 XIRR이고, 원금 대비 비율은 참고값으로만 남겼다.
 
-TWR은 `prices` 테이블에 일별 종가가 쌓여야 계산된다 — 대시보드를 열 때마다 자동 적재되며,
-이틀치가 모이면 나온다. 그 전에는 "가격 이력이 N일치뿐입니다"라고 표시된다.
+TWR은 `prices` 테이블에 일별 종가가 쌓여야 계산된다 — **매일 16:00 잡**(`com.etf-advisor.prices`)이
+장 마감가로 적재하고, 대시보드를 열 때도 그 시점 값으로 한 번 더 적재된다. 이틀치가 모이면 나오고,
+그 전에는 "가격 이력이 N일치뿐입니다"라고 표시된다.
+
+그 16:00 잡은 매월 충전도 함께 돌리므로, **화면을 한 번도 열지 않아도 그 달 잔액이 하루 안에 들어온다.**
 
 분배금은 **세후 실수령액**이 기준이고, 세전 총액·세액을 함께 넣으면 배당 수익 옆에 병기된다.
 
@@ -144,6 +153,10 @@ pnpm run check:consolidate # ⑤ 종목 정리 제안 정규화 검증 (DB 불�
 pnpm run check:data       # 수집 수치 자가검증 게이트 (DB 불필요)
 pnpm run check:official   # 공식 시세 API 필드·괴리율 검증 (키 필요)
 pnpm run check:usage      # codex 사용량 수집 검증 (세션 기록 필요)
+pnpm run check:accept     # A1 추천 확정 이중 제출 방지 (별도 DB)
+pnpm run check:switch     # A3 갈아타기 묶음 삭제 거부·취소 (별도 DB)
+pnpm run check:purchase-guard # A2 수기 매입 잔액 검증 (별도 DB)
+pnpm run check:perf-transfer  # A7 고배당 이전 시 XIRR 납입액 (별도 DB)
 pnpm run db:push          # 스키마 반영
 pnpm build                # 타입 검사 포함
 ```

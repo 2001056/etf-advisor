@@ -65,16 +65,38 @@ export type NormalizedPick = {
   sellTicker: string | null;
   sellQty: number | null;
   sellRefPrice: number | null;
+  /** 조사 문서에 적혀 있던 원래 가격 — refPrice가 실시간가로 바뀌어도 남는다 */
+  researchPrice: number | null;
+  sellResearchPrice: number | null;
+  /** refPrice가 어디서 온 값인지 */
+  priceSource: PriceSource;
+  /** 실시간가일 때의 기준 시각 */
+  pricedAt: Date | null;
   skipped: boolean;
   rationale: string;
   sourceDocIds: number[];
   sourceUrls: string[];
 };
 
+export type PriceSource = "realtime" | "research";
+
+/** 실시간 시세 한 건 — server/livePrice.getRealtimePrices의 결과에서 쓰는 부분만 */
+export type RealtimeQuote = { price: number; pricedAt: Date };
+
 export type NormalizeResult = {
   rows: NormalizedPick[];
   dropped: string[];
 };
+
+/** 배정액(+매도 예상대금)으로 몇 주를 살 수 있는지 — 정규화·교체·화면이 같은 식을 쓴다 */
+export function computeRefQty(
+  budget: number,
+  proceeds: number,
+  price: number,
+): number {
+  if (!(price > 0)) return 0;
+  return Math.floor((budget + proceeds) / price);
+}
 
 /**
  * 고배당을 건너뛸 때에만 그 잔액을 배당성장·자산성장에 5:3(기존 50:30 비중)으로 나눈다.
@@ -235,7 +257,7 @@ export function normalizePicks(
     const qty =
       d.skipped || d.refPrice === null
         ? 0
-        : Math.floor((budgets[d.category] + proceeds) / d.refPrice);
+        : computeRefQty(budgets[d.category], proceeds, d.refPrice);
     const skipped = d.skipped || qty <= 0;
 
     return {
@@ -249,6 +271,10 @@ export function normalizePicks(
       sellTicker: skipped ? null : d.sellTicker,
       sellQty: skipped ? null : d.sellQty,
       sellRefPrice: skipped ? null : d.sellRefPrice,
+      researchPrice: skipped ? null : d.refPrice,
+      sellResearchPrice: skipped ? null : d.sellRefPrice,
+      priceSource: "research",
+      pricedAt: null,
       skipped,
       rationale: d.rationale,
       sourceDocIds: d.sourceDocIds,
@@ -257,4 +283,89 @@ export function normalizePicks(
   });
 
   return { rows, dropped };
+}
+
+/** 조사가에서 이만큼 벌어진 실시간가는 오파싱으로 보고 버린다 */
+const MAX_PRICE_DRIFT = 0.3;
+
+export function isDrift(price: number, research: number | null): boolean {
+  if (research === null || research <= 0) return false;
+  return Math.abs(price - research) / research > MAX_PRICE_DRIFT;
+}
+
+export type RealtimeApplyResult = {
+  rows: NormalizedPick[];
+  /** 실시간가를 실제로 갈아끼운 행 수 */
+  applied: number;
+  /** 갈아끼울 수 있었던 행 수 (건너뛰지 않은 행) */
+  eligible: number;
+  /** 갈아끼우지 않은 행과 그 이유 */
+  excluded: string[];
+};
+
+/**
+ * 정규화된 추천의 기준가를 추천 시점의 실시간 체결가로 갈아끼운다.
+ *
+ * 조사 문서의 price는 ②가 웹을 훑은 시점 값이라 몇 분~몇 시간 묵는다. 증권사 앱은
+ * KRX 체결가를 보여주므로 그대로 두면 "몇 주 살 수 있는지"가 어긋난다.
+ * 실시간가를 못 얻은 종목은 조사 가격을 그대로 둔다. 원값은 researchPrice에 남는다.
+ *
+ * 갈아끼운 뒤 수량이 0이 되면 그 행은 매수·매도 다리를 모두 되돌린다 —
+ * normalizePicks가 세운 "수량 0이면 반드시 건너뜀"을 여기서 깨면 안 되고,
+ * 수량 0인 채로 건너뜀이 아닌 행은 잔액 검증이 없는 갈아타기 경로에서 원장을 음수로 만든다.
+ */
+export function applyRealtimePrices(
+  rows: NormalizedPick[],
+  quotes: Map<string, RealtimeQuote>,
+): RealtimeApplyResult {
+  const excluded: string[] = [];
+  let applied = 0;
+  let eligible = 0;
+
+  const out = rows.map((r) => {
+    if (r.skipped || r.ticker === null || r.refPrice === null) return r;
+    eligible++;
+
+    const buyRaw = quotes.get(r.ticker);
+    const sellRaw = r.sellTicker ? quotes.get(r.sellTicker) : undefined;
+
+    const buyDrift =
+      buyRaw !== undefined && isDrift(buyRaw.price, r.researchPrice ?? r.refPrice);
+    const sellDrift =
+      sellRaw !== undefined &&
+      isDrift(sellRaw.price, r.sellResearchPrice ?? r.sellRefPrice);
+    if (buyDrift) excluded.push(`${r.ticker} 조사가와 30% 넘게 차이`);
+    if (sellDrift) excluded.push(`${r.sellTicker} 매도가가 조사가와 30% 넘게 차이`);
+
+    const buy = buyRaw && !buyDrift ? buyRaw : null;
+    const sell = sellRaw && !sellDrift ? sellRaw : null;
+    if (!buy && !sell) {
+      if (!buyDrift && !sellDrift) excluded.push(`${r.ticker} 실시간가 없음`);
+      return r;
+    }
+
+    const refPrice = buy ? buy.price : r.refPrice;
+    const sellRefPrice = sell ? sell.price : r.sellRefPrice;
+    const proceeds =
+      r.sellTicker && r.sellQty && sellRefPrice ? r.sellQty * sellRefPrice : 0;
+    const refQty = computeRefQty(r.budgetKrw, proceeds, refPrice);
+
+    if (refQty <= 0) {
+      excluded.push(`${r.ticker} 실시간가로는 1주도 못 사서 조사가 유지`);
+      return r;
+    }
+
+    applied++;
+    return {
+      ...r,
+      refPrice,
+      sellRefPrice,
+      refQty,
+      // 매수·매도 어느 다리든 갈아끼웠으면 실시간이다
+      priceSource: "realtime" as PriceSource,
+      pricedAt: (buy ?? sell)!.pricedAt,
+    };
+  });
+
+  return { rows: out, applied, eligible, excluded };
 }

@@ -35,6 +35,8 @@ export type PerfResult = {
 export type Performance = {
   security: PerfResult;
   portfolio: PerfResult;
+  /** 외부에서 넣은 돈의 합계. 카테고리 간 이전은 상쇄돼 들어오지 않는다 */
+  paidIn: number;
   /** 시간가중수익률 — 가격 이력이 쌓여야 계산된다 */
   twr: {
     cumulativePct: number;
@@ -187,7 +189,9 @@ export async function getPerformance(opts: {
   );
 
   // ── 포트폴리오 레벨 ──
-  // 외부 유입 = topup + (재투자가 아닌) adjust
+  // 외부 유입 = topup + (재투자가 아닌) adjust. adjust는 양수만이 아니라 순액으로 본다 —
+  // 카테고리 간 이전은 한 트랜잭션에서 같은 ts로 −/+ 한 쌍이 남으므로 전체 조회에서는
+  // 상쇄되고, 카테고리별 조회에서는 한쪽만 남아 그 카테고리의 유입/유출로 남는다.
   const reinvested = await db
     .select({ id: dividends.refLedgerId })
     .from(dividends)
@@ -202,18 +206,28 @@ export async function getPerformance(opts: {
       a: ledger.amountKrw,
       t: ledger.type,
       id: ledger.id,
+      ts: ledger.ts,
     })
     .from(ledger)
     .where(
       opts.category ? eq(ledger.category, opts.category) : undefined,
     );
 
-  const external = inflows.filter(
-    (r) =>
-      (r.t === "topup" || r.t === "adjust") &&
-      r.a > 0 &&
-      !reinvestedIds.includes(r.id),
-  );
+  const adjustNet = new Map<number, { d: string; a: number }>();
+  for (const r of inflows) {
+    if (r.t !== "adjust" || reinvestedIds.includes(r.id)) continue;
+    const key = r.ts.getTime();
+    const g = adjustNet.get(key);
+    if (g) g.a += r.a;
+    else adjustNet.set(key, { d: r.d, a: r.a });
+  }
+
+  const external: { d: string; a: number }[] = [
+    ...inflows
+      .filter((r) => r.t === "topup" && r.a > 0 && !reinvestedIds.includes(r.id))
+      .map((r) => ({ d: r.d, a: r.a })),
+    ...[...adjustNet.values()].filter((g) => g.a !== 0),
+  ];
 
   const portFlows: CashFlow[] = external.map((r) => ({
     date: r.d,
@@ -233,6 +247,7 @@ export async function getPerformance(opts: {
   return {
     security,
     portfolio,
+    paidIn,
     twr: twrResult,
     twrReason,
     partial: opts.partial,

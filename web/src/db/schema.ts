@@ -129,6 +129,12 @@ export const recommendations = pgTable("recommendations", {
   sellTicker: text("sell_ticker"),
   sellQty: integer("sell_qty"),
   sellRefPrice: integer("sell_ref_price"), // 매도 종목의 조사 가격 스냅샷 (대금 추정용)
+  // ref_price는 정규화 뒤 추천 시점의 실시간 체결가로 교체될 수 있다.
+  // 교체돼도 ②가 적어 온 원래 가격은 여기 남는다.
+  researchPrice: integer("research_price"),
+  sellResearchPrice: integer("sell_research_price"),
+  priceSource: text("price_source").notNull().default("research"), // 'realtime' | 'research'
+  pricedAt: timestamp("priced_at", { withTimezone: true }), // 실시간가의 기준 시각
   skipped: boolean("skipped").notNull().default(false), // 1주도 못 사서 이월
   rationale: text("rationale").notNull(),
   sourceDocIds: jsonb("source_doc_ids"),
@@ -207,26 +213,35 @@ export const consolidationSuggestions = pgTable("consolidation_suggestions", {
   resolvedAt: timestamp("resolved_at", { withTimezone: true }),
 });
 
-export const purchases = pgTable("purchases", {
-  id: serial("id").primaryKey(),
-  boughtAt: date("bought_at").notNull(),
-  category: categoryEnum("category").notNull(),
-  ticker: text("ticker").notNull(),
-  etfName: text("etf_name").notNull(),
-  qty: integer("qty").notNull(),
-  unitPrice: integer("unit_price").notNull(),
-  amountKrw: integer("amount_krw").notNull(),
-  recommendationId: integer("recommendation_id").references(
-    () => recommendations.id,
-  ),
-  // 갈아타기 묶음: 같은 값을 가진 sales 1행 + purchases 1행이 한 번의 교체(매도→매수)다.
-  // 일반 매수는 NULL. 형식은 actionId 관례를 따라 "sw-<timestamp>".
-  switchGroupId: text("switch_group_id"),
-  memo: text("memo"),
-  createdAt: timestamp("created_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
+export const purchases = pgTable(
+  "purchases",
+  {
+    id: serial("id").primaryKey(),
+    boughtAt: date("bought_at").notNull(),
+    category: categoryEnum("category").notNull(),
+    ticker: text("ticker").notNull(),
+    etfName: text("etf_name").notNull(),
+    qty: integer("qty").notNull(),
+    unitPrice: integer("unit_price").notNull(),
+    amountKrw: integer("amount_krw").notNull(),
+    recommendationId: integer("recommendation_id").references(
+      () => recommendations.id,
+    ),
+    // 갈아타기 묶음: 같은 값을 가진 sales 1행 + purchases 1행이 한 번의 교체(매도→매수)다.
+    // 일반 매수는 NULL. 형식은 actionId 관례를 따라 "sw-<timestamp>".
+    switchGroupId: text("switch_group_id"),
+    memo: text("memo"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    // 추천 확정 멱등키: 추천 1건은 매입 1행까지 (§5 A1). 수기 매입(NULL)은 제한 없음
+    uniqueIndex("purchases_one_per_recommendation")
+      .on(t.recommendationId)
+      .where(sql`${t.recommendationId} is not null`),
+  ],
+);
 
 /**
  * 매도 기록. 갈아타기(교체)와 단독 매도를 함께 담는다.

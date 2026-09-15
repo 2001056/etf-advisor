@@ -334,3 +334,14 @@ export function tickersOf(doc: ParsedDoc): string[] {
     Boolean,
   );
 }
+
+/** parse_problems 를 형식 문제와 데이터 자가검증 주의로 나눈다. 데이터 점검 항목은 "[주의]" 접두어를 갖는다. */
+export function splitProblems(problems: string[] | null | undefined): {
+  format: string[];
+  data: string[];
+} {
+  const format: string[] = [];
+  const data: string[] = [];
+  for (const p of problems ?? []) (p.startsWith("[주의]") ? data : format).push(p);
+  return { format, data };
+}

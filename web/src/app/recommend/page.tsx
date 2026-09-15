@@ -5,19 +5,58 @@ import {
   CATEGORIES,
   CATEGORY_LABEL,
   Category,
+  dateKeyKST,
   formatKRW,
 } from "@/domain/money";
+import { computeRefQty, isDrift } from "@/domain/recommendation";
 import { getAllPrompts } from "@/domain/prompts";
+import { acceptedRecommendationIds } from "@/domain/purchases";
 import {
   getRunningRun,
   latestRecommendation,
   tickersToResearch,
 } from "@/server/orchestrator";
+import { getRealtimePrices, RealtimePrice } from "@/server/livePrice";
 import { Card, Notice, Page } from "@/components/ui";
 import Runner from "./runner";
 import AcceptForm from "./accept";
 
 export const dynamic = "force-dynamic";
+
+/** 기준 시각을 KST 시:분으로 */
+function hhmmKST(d: Date): string {
+  return new Intl.DateTimeFormat("ko-KR", {
+    timeZone: "Asia/Seoul",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(d);
+}
+
+/** "9/11" — KST 기준 */
+function mdKST(d: Date): string {
+  const [, m, day] = dateKeyKST(d).split("-");
+  return `${Number(m)}/${Number(day)}`;
+}
+
+/**
+ * 저장된 기준 시각 표기. 오늘이 아니면 날짜를 앞에 붙인다 —
+ * 시·분만 보이면 지난 영업일 종가가 오늘 값처럼 읽힌다.
+ */
+function stampKST(d: Date | null): string {
+  if (!d) return "";
+  return dateKeyKST(d) === dateKeyKST()
+    ? hhmmKST(d)
+    : `${mdKST(d)} ${hhmmKST(d)}`;
+}
+
+/** 방금 조회한 시세를 뭐라고 부를지 — 휴장일 종가를 "지금 시세"로 보여주지 않는다 */
+function quoteLabel(q: RealtimePrice): string {
+  if (dateKeyKST(q.pricedAt) !== dateKeyKST()) return `${mdKST(q.pricedAt)} 종가`;
+  return q.marketStatus === "OPEN"
+    ? `지금 시세 ${hhmmKST(q.pricedAt)}`
+    : `오늘 종가 ${hhmmKST(q.pricedAt)}`;
+}
 
 export default async function RecommendPage() {
   if (!(await isOnboarded())) redirect("/onboarding");
@@ -34,6 +73,41 @@ export default async function RecommendPage() {
   const placeholders = (["purchase", "recommend"] as const).filter(
     (s) => prompts[s].isPlaceholder,
   );
+
+  // 저장된 기준가는 추천을 돌린 시점의 값이다. 화면을 여는 지금 값도 같이 보여준다.
+  const quoteTickers = [
+    ...new Set(
+      (latest?.picks ?? [])
+        .flatMap((p) => [p.ticker, p.sellTicker])
+        .filter((t): t is string => Boolean(t)),
+    ),
+  ];
+  const [acceptedIds, now] = await Promise.all([
+    acceptedRecommendationIds(latest?.picks.map((p) => p.id) ?? []),
+    quoteTickers.length
+      ? getRealtimePrices(quoteTickers)
+      : Promise.resolve(new Map<string, RealtimePrice>()),
+  ]);
+  // 렌더 시점 조회라 두 탭을 열면 TOCTOU가 남는다 — 최종 방어는 DB 유니크다
+  const accepted = new Set(acceptedIds);
+
+  type Pick = NonNullable<typeof latest>["picks"][number];
+  /** 조사가에서 ±30% 넘게 벌어진 시세는 오파싱으로 보고 화면에서도 버린다 */
+  const nowOf = (p: Pick) => {
+    const q = p.ticker ? (now.get(p.ticker) ?? null) : null;
+    if (!q) return null;
+    return isDrift(q.price, p.researchPrice ?? p.refPrice) ? null : q;
+  };
+  /** 지금 시세로 다시 세어 본 수량 — 표시 전용이라 저장된 refQty는 건드리지 않는다 */
+  const nowQtyOf = (p: Pick) => {
+    const price = nowOf(p)?.price;
+    if (!price) return 0;
+    const sellPrice = p.sellTicker
+      ? (now.get(p.sellTicker)?.price ?? p.sellRefPrice)
+      : null;
+    const proceeds = p.sellQty && sellPrice ? p.sellQty * sellPrice : 0;
+    return computeRefQty(p.budgetKrw, proceeds, price);
+  };
 
   return (
     <Page current="/">
@@ -81,7 +155,7 @@ export default async function RecommendPage() {
 
       {latest && (
         <Card
-          title={`추천 결과 (${latest.run.finishedAt?.toLocaleString("ko-KR") ?? ""})`}
+          title={`추천 결과 (${stampKST(latest.run.finishedAt)})`}
         >
           <Notice kind="warn">
             가격·수량은 조사 시점의 참고치입니다. 최종 확인과 실제 주문은 증권사
@@ -158,7 +232,51 @@ export default async function RecommendPage() {
                           {((p.refQty ?? 0) * p.refPrice).toLocaleString("ko-KR")}원
                         </span>
                       )}
+                      <span
+                        className={`ml-2 rounded px-1.5 py-0.5 text-xs ${
+                          p.priceSource === "realtime"
+                            ? "bg-emerald-100 text-emerald-800"
+                            : "bg-neutral-100 text-neutral-600"
+                        }`}
+                      >
+                        {p.priceSource === "realtime"
+                          ? `실시간 ${stampKST(p.pricedAt)} 기준`
+                          : "조사 문서 기준"}
+                      </span>
+                      {p.refPrice === p.researchPrice &&
+                        p.sellRefPrice !== p.sellResearchPrice && (
+                          <span className="ml-1 text-xs text-neutral-500">
+                            (매도가만 실시간)
+                          </span>
+                        )}
+                      {p.priceSource === "realtime" &&
+                        p.researchPrice != null &&
+                        p.refPrice != null &&
+                        p.researchPrice !== p.refPrice && (
+                          <span className="ml-1 text-xs text-neutral-400">
+                            조사 {p.researchPrice.toLocaleString("ko-KR")}원 →
+                            실시간 {p.refPrice.toLocaleString("ko-KR")}원
+                          </span>
+                        )}
                     </p>
+                    {nowOf(p) ? (
+                      <p className="text-xs text-blue-700 tabular-nums">
+                        {quoteLabel(nowOf(p)!)}{" "}
+                        {nowOf(p)!.price.toLocaleString("ko-KR")}원 → 살 수 있는
+                        수량 {nowQtyOf(p)}주
+                        {!accepted.has(p.id) && (
+                          <span className="ml-1 text-neutral-500">
+                            아래 기록 폼은 이 줄의 값으로 채웠습니다
+                          </span>
+                        )}
+                      </p>
+                    ) : (
+                      !accepted.has(p.id) && (
+                        <p className="text-xs text-neutral-500">
+                          기록 폼은 저장된 값으로 채웠습니다
+                        </p>
+                      )
+                    )}
                     {p.refPrice != null && (
                       <p className="text-xs text-neutral-500 tabular-nums">
                         배정 {p.budgetKrw.toLocaleString("ko-KR")}원 − 매수{" "}
@@ -199,16 +317,30 @@ export default async function RecommendPage() {
                   </ul>
                 )}
 
-                {!p.skipped && (
-                  <AcceptForm
-                    id={p.id}
-                    defaultQty={p.refQty ?? 0}
-                    defaultPrice={p.refPrice ?? 0}
-                    sellTicker={p.sellTicker}
-                    sellDefaultQty={p.sellQty}
-                    sellDefaultPrice={p.sellRefPrice}
-                  />
-                )}
+                {!p.skipped &&
+                  (accepted.has(p.id) ? (
+                    <p className="mt-3 border-t border-neutral-100 pt-3 text-sm text-green-700">
+                      <span className="rounded bg-green-100 px-1.5 py-0.5 text-xs text-green-800">
+                        기록 완료
+                      </span>{" "}
+                      이 추천은 이미 매입으로 기록되었습니다.
+                    </p>
+                  ) : (
+                    <AcceptForm
+                      id={p.id}
+                      // 수량과 단가는 같은 시점 값으로 짝을 맞춘다 —
+                      // 섞으면 화면 어느 줄과도 맞지 않는 세 번째 조합이 된다
+                      defaultQty={nowOf(p) ? nowQtyOf(p) : (p.refQty ?? 0)}
+                      defaultPrice={nowOf(p)?.price ?? p.refPrice ?? 0}
+                      sellTicker={p.sellTicker}
+                      sellDefaultQty={p.sellQty}
+                      sellDefaultPrice={
+                        (nowOf(p) && p.sellTicker
+                          ? now.get(p.sellTicker)?.price
+                          : null) ?? p.sellRefPrice
+                      }
+                    />
+                  ))}
               </div>
             ))}
           </div>

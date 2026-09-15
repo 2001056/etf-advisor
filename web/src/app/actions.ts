@@ -36,13 +36,21 @@ import {
 } from "@/domain/research";
 import { addDividend, deleteDividend } from "@/domain/dividends";
 import {
-  addPurchase,
+  acceptedRecommendationIds,
+  addManualPurchase,
   addPurchaseWithHighDivTransfer,
+  cancelSwitch,
   deletePurchase,
+  duplicateRecommendationMessage,
   executeSwitch,
   updatePurchase,
 } from "@/domain/purchases";
-import { CATEGORIES, Category, dateKeyKST, monthKeyKST } from "@/domain/money";
+import {
+  CATEGORIES,
+  Category,
+  dateKeyKST,
+  monthKeyKST,
+} from "@/domain/money";
 
 function num(v: FormDataEntryValue | null): number {
   const n = Number(String(v ?? "").replace(/[,\s원]/g, ""));
@@ -122,43 +130,83 @@ export async function onboardingAction(formData: FormData) {
   redirect("/");
 }
 
-export async function addPurchaseAction(formData: FormData) {
+export async function addPurchaseAction(
+  formData: FormData,
+): Promise<{ ok?: true; error?: string }> {
   await requireSession();
-  await addPurchase({
-    boughtAt: String(formData.get("boughtAt") || dateKeyKST()),
-    category: category(formData.get("category")),
-    ticker: String(formData.get("ticker") ?? "").trim(),
-    etfName: String(formData.get("etfName") ?? "").trim(),
-    qty: positiveNum(formData.get("qty"), "수량"),
-    unitPrice: positiveNum(formData.get("unitPrice"), "매입 단가"),
-    memo: String(formData.get("memo") ?? "") || null,
-    skipLedger: formData.get("skipLedger") === "on",
-  });
+  try {
+    await addManualPurchase(
+      {
+        boughtAt: String(formData.get("boughtAt") || dateKeyKST()),
+        category: category(formData.get("category")),
+        ticker: String(formData.get("ticker") ?? "").trim(),
+        etfName: String(formData.get("etfName") ?? "").trim(),
+        qty: positiveNum(formData.get("qty"), "수량"),
+        unitPrice: positiveNum(formData.get("unitPrice"), "매입 단가"),
+        memo: String(formData.get("memo") ?? "") || null,
+        skipLedger: formData.get("skipLedger") === "on",
+      },
+      { allowOverBalance: formData.get("allowOverBalance") === "on" },
+    );
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
   revalidatePath("/purchases");
   revalidatePath("/");
+  return { ok: true };
 }
 
-export async function updatePurchaseAction(formData: FormData) {
+export async function updatePurchaseAction(
+  formData: FormData,
+): Promise<{ ok?: true; error?: string }> {
   await requireSession();
   const id = num(formData.get("id"));
-  await updatePurchase(id, {
-    boughtAt: String(formData.get("boughtAt")),
-    category: category(formData.get("category")),
-    ticker: String(formData.get("ticker") ?? "").trim(),
-    etfName: String(formData.get("etfName") ?? "").trim(),
-    qty: positiveNum(formData.get("qty"), "수량"),
-    unitPrice: positiveNum(formData.get("unitPrice"), "매입 단가"),
-    memo: String(formData.get("memo") ?? "") || null,
-  });
+  try {
+    await updatePurchase(id, {
+      boughtAt: String(formData.get("boughtAt")),
+      category: category(formData.get("category")),
+      ticker: String(formData.get("ticker") ?? "").trim(),
+      etfName: String(formData.get("etfName") ?? "").trim(),
+      qty: positiveNum(formData.get("qty"), "수량"),
+      unitPrice: positiveNum(formData.get("unitPrice"), "매입 단가"),
+      memo: String(formData.get("memo") ?? "") || null,
+    });
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
   revalidatePath("/purchases");
   revalidatePath("/");
+  return { ok: true };
 }
 
-export async function deletePurchaseAction(formData: FormData) {
+export async function deletePurchaseAction(
+  formData: FormData,
+): Promise<{ ok?: true; error?: string }> {
   await requireSession();
-  await deletePurchase(num(formData.get("id")));
+  try {
+    await deletePurchase(num(formData.get("id")));
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
   revalidatePath("/purchases");
   revalidatePath("/");
+  return { ok: true };
+}
+
+/** 갈아타기 묶음 취소 — 매수·매도·원장 행을 함께 되돌린다 (§5 A3) */
+export async function cancelSwitchAction(
+  formData: FormData,
+): Promise<{ ok?: true; error?: string }> {
+  await requireSession();
+  try {
+    await cancelSwitch(String(formData.get("groupId") ?? ""));
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+  revalidatePath("/switch");
+  revalidatePath("/purchases");
+  revalidatePath("/");
+  return { ok: true };
 }
 
 /**
@@ -253,13 +301,15 @@ export async function deleteDividendAction(formData: FormData) {
  * 실행은 최대 30분(각 15분 타임아웃)까지 걸릴 수 있으므로 **기다리지 않고 시작만** 한다.
  * 진행 상황은 클라이언트가 /api/status를 폴링해 따라간다 — 브라우저를 닫아도 계속 진행된다.
  */
-export async function startRecommendAction() {
+export async function startRecommendAction(force = false) {
   await requireSession();
   if (await getRunningRun()) {
     return { error: "이미 실행 중인 에이전트가 있습니다. 끝난 뒤 다시 시도하세요." };
   }
+  const flow = runRecommendFlow({ force });
+  if ("blocked" in flow) return { error: flow.blocked };
 
-  runRecommendFlow().catch((e) => {
+  flow.started.catch((e) => {
     if (e instanceof BusyError) return; // 동시 클릭 — DB 유니크 인덱스가 막았다
     console.error("[recommend] 흐름 실패", e);
   });
@@ -353,6 +403,11 @@ export async function acceptRecommendationAction(formData: FormData) {
   if (rec.skipped || !rec.ticker) {
     return { error: "건너뛴 추천은 매입 기록으로 옮길 수 없습니다" };
   }
+  // 갈아타기 재확정은 매도 단계가 먼저 터져 "보유분이 없습니다"류로 새는 탓에 여기서 끊는다.
+  // DB 유니크는 동시 제출용 최종 방어로 그대로 둔다.
+  if ((await acceptedRecommendationIds([rec.id])).length > 0) {
+    return { error: "이 추천은 이미 매입으로 기록되었습니다" };
+  }
 
   // 갈아타기 추천이면 매도→매수를 한 트랜잭션으로 (매도가 실패하면 매수도 안 된다)
   if (rec.sellTicker) {
@@ -374,6 +429,8 @@ export async function acceptRecommendationAction(formData: FormData) {
         recommendationId: rec.id,
       });
     } catch (e) {
+      const dup = duplicateRecommendationMessage(e);
+      if (dup) return { error: dup };
       return { error: e instanceof Error ? e.message : String(e) };
     }
 
@@ -400,6 +457,8 @@ export async function acceptRecommendationAction(formData: FormData) {
       { allowTransfer: highDivSkipped },
     );
   } catch (e) {
+    const dup = duplicateRecommendationMessage(e);
+    if (dup) return { error: dup };
     return { error: e instanceof Error ? e.message : String(e) };
   }
 

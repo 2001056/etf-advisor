@@ -1,9 +1,5 @@
 import { redirect } from "next/navigation";
-import {
-  addPurchaseAction,
-  closeCycleAction,
-  deletePurchaseAction,
-} from "../actions";
+import { closeCycleAction } from "../actions";
 import { getBalances, getCycle, isOnboarded } from "@/domain/ledger";
 import { listPurchases } from "@/domain/purchases";
 import { tickerCandidates } from "@/domain/tickers";
@@ -15,15 +11,9 @@ import {
   formatKRW,
   monthKeyKST,
 } from "@/domain/money";
-import {
-  buttonClass,
-  Card,
-  Field,
-  inputClass,
-  Notice,
-  Page,
-} from "@/components/ui";
-import TickerPicker from "@/components/TickerPicker";
+import { buttonClass, Card, Notice, Page } from "@/components/ui";
+import PurchaseForm from "./form";
+import DeletePurchaseButton from "./delete";
 
 export const dynamic = "force-dynamic";
 
@@ -42,67 +32,29 @@ export default async function PurchasesPage() {
       <h1 className="text-xl font-bold">매입 기록</h1>
 
       <Card title="매입 추가">
-        <form action={addPurchaseAction} className="grid gap-4 sm:grid-cols-3">
-          <Field label="매입일">
-            <input
-              name="boughtAt"
-              type="date"
-              defaultValue={dateKeyKST()}
-              required
-              className={inputClass}
-            />
-          </Field>
-          <Field label="구분">
-            <select name="category" required className={inputClass}>
-              {CATEGORIES.map((c) => (
-                <option key={c} value={c}>
-                  {CATEGORY_LABEL[c]} (잔액 {formatKRW(balances[c as Category])})
-                </option>
-              ))}
-            </select>
-          </Field>
-          <div className="sm:col-span-2">
-            <TickerPicker candidates={candidates} categoryName="category" />
-          </div>
-          <Field label="수량(주)">
-            <input
-              name="qty"
-              type="number"
-              min={1}
-              required
-              className={inputClass}
-            />
-          </Field>
-          <Field label="매입 단가(원)" hint="평단가는 자동으로 계산됩니다">
-            <input
-              name="unitPrice"
-              type="number"
-              min={1}
-              required
-              className={inputClass}
-            />
-          </Field>
-          <div className="sm:col-span-3 flex flex-wrap items-center gap-4">
-            <label className="flex items-center gap-2 text-sm text-neutral-700">
-              <input type="checkbox" name="skipLedger" className="size-4" />
-              기존 보유분 (잔액에서 차감하지 않음)
-            </label>
-            <button className={buttonClass}>추가</button>
-          </div>
-        </form>
+        <PurchaseForm
+          today={dateKeyKST()}
+          categories={CATEGORIES.map((c) => ({
+            value: c,
+            label: `${CATEGORY_LABEL[c]} (잔액 ${formatKRW(balances[c as Category])})`,
+          }))}
+          candidates={candidates}
+        />
       </Card>
 
       <Card title={`${monthKeyKST()} 매입 마감`}>
         {cycle ? (
           <Notice>
-            {monthKeyKST()} 매입이 마감되었습니다. 다음날 다음 달 충전이
-            들어옵니다.
+            {monthKeyKST()} 매입이 마감되었습니다. 마감 24시간 뒤 다음 달
+            충전이 들어옵니다(매일 16:00 자동 작업 또는 화면을 열 때 반영).
           </Notice>
         ) : (
           <form action={closeCycleAction} className="space-y-3">
             <p className="text-sm text-neutral-600">
-              이번 달 매입을 전부 기록했으면 마감하세요. 마감 다음날 남은 잔액에
-              월 충전액이 더해집니다.
+              이번 달 매입을 전부 기록했으면 마감하세요. 남은 잔액에 월 충전액이
+              더해지는 시점은 마감 시각으로부터 24시간 뒤입니다(달력상 다음날이
+              아닙니다). 그 뒤 화면을 열거나 매일 16:00 자동 작업이 돌면
+              반영됩니다.
             </p>
             <button className={buttonClass}>이번 달 매입 마감</button>
           </form>
@@ -143,12 +95,13 @@ export default async function PurchasesPage() {
                       {r.amountKrw.toLocaleString("ko-KR")}
                     </td>
                     <td className="text-right">
-                      <form action={deletePurchaseAction}>
-                        <input type="hidden" name="id" value={r.id} />
-                        <button className="text-xs text-red-600 hover:underline">
-                          삭제
-                        </button>
-                      </form>
+                      {r.switchGroupId ? (
+                        <span className="text-xs text-neutral-400">
+                          갈아타기 묶음 — /switch 에서 취소
+                        </span>
+                      ) : (
+                        <DeletePurchaseButton id={r.id} />
+                      )}
                     </td>
                   </tr>
                 ))}

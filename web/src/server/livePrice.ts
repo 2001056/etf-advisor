@@ -37,8 +37,19 @@ export type LivePrice = {
   tradedAt: Date;
 };
 
+/** 네이버 폴링만 쓴 값 — 장중이면 현재가, 장 마감 뒤면 당일 종가 */
+export type RealtimePrice = {
+  ticker: string;
+  price: number;
+  /** 기준 시각 — 응답의 localTradedAt, 없으면 조회 시각 */
+  pricedAt: Date;
+  change: number | null;
+  marketStatus: string | null;
+};
+
 type CacheEntry = { at: number; value: LivePrice };
 const cache = new Map<string, CacheEntry>();
+const realtimeCache = new Map<string, { at: number; value: RealtimePrice }>();
 
 function parseKrw(v: unknown): number | null {
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
@@ -99,8 +110,31 @@ export async function getLivePrices(
   const stillMissing = missing.filter((t) => !out.has(t));
   if (stillMissing.length === 0) return out;
 
+  for (const [ticker, r] of await fetchNaver(stillMissing)) {
+    const value: LivePrice = {
+      ticker,
+      price: r.price,
+      change: r.change,
+      marketStatus: r.marketStatus,
+      tradedAt: r.pricedAt,
+      source: "naver",
+      nav: null,
+      premium: null,
+    };
+    cache.set(ticker, { at: now, value });
+    out.set(ticker, value);
+  }
+
+  return out;
+}
+
+/** 네이버 폴링 한 번. 실패·타임아웃은 조용히 빈 Map. */
+async function fetchNaver(tickers: string[]): Promise<Map<string, RealtimePrice>> {
+  const out = new Map<string, RealtimePrice>();
+  if (tickers.length === 0) return out;
+
   try {
-    const res = await fetch(`${ENDPOINT}/${stillMissing.join(",")}`, {
+    const res = await fetch(`${ENDPOINT}/${tickers.join(",")}`, {
       headers: { "User-Agent": UA, Accept: "application/json" },
       signal: AbortSignal.timeout(TIMEOUT_MS),
       cache: "no-store",
@@ -120,23 +154,47 @@ export async function getLivePrices(
       const traded =
         typeof tradedRaw === "string" ? new Date(tradedRaw) : new Date();
 
-      const value: LivePrice = {
+      out.set(ticker, {
         ticker,
         price,
         change: parseKrw(row.compareToPreviousClosePrice),
         marketStatus:
           typeof row.marketStatus === "string" ? row.marketStatus : null,
-        tradedAt: Number.isNaN(traded.getTime()) ? new Date() : traded,
-        source: "naver",
-        nav: null,
-        premium: null,
-      };
-
-      cache.set(ticker, { at: now, value });
-      out.set(ticker, value);
+        pricedAt: Number.isNaN(traded.getTime()) ? new Date() : traded,
+      });
     }
   } catch {
-    // 타임아웃·네트워크 실패는 조용히 넘어간다. 조사 문서 가격이 대신 쓰인다.
+    // 타임아웃·네트워크 실패는 조용히 넘어간다.
+  }
+
+  return out;
+}
+
+/**
+ * 증권사 앱에 보이는 값에 맞추기 위한 실시간 전용 조회.
+ *
+ * 공식 API는 일별 종가(basDt 기준)라 장중에는 이미 지난 값이다. 그래서 여기서는
+ * 공식 API를 건너뛰고 네이버 폴링만 쓴다 — 장중이면 현재가, 장 마감 뒤면 당일 종가.
+ * 실패하면 빈 Map을 돌려주고 호출부가 조사 문서 가격을 그대로 쓴다.
+ */
+export async function getRealtimePrices(
+  tickers: string[],
+): Promise<Map<string, RealtimePrice>> {
+  const out = new Map<string, RealtimePrice>();
+  const now = Date.now();
+
+  const wanted = [...new Set(tickers.filter((t) => /^[0-9A-Z]{5,12}$/i.test(t)))];
+  const missing: string[] = [];
+
+  for (const t of wanted) {
+    const hit = realtimeCache.get(t);
+    if (hit && now - hit.at < CACHE_TTL_MS) out.set(t, hit.value);
+    else missing.push(t);
+  }
+
+  for (const [ticker, value] of await fetchNaver(missing)) {
+    realtimeCache.set(ticker, { at: now, value });
+    out.set(ticker, value);
   }
 
   return out;
