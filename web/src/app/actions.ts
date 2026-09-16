@@ -409,6 +409,9 @@ export async function acceptRecommendationAction(formData: FormData) {
     return { error: "이 추천은 이미 매입으로 기록되었습니다" };
   }
 
+  // 같은 회차에서 고배당을 건너뛰었다면 그 잔액을 끌어와 쓸 수 있다 (§2.2 예외)
+  const highDivSkipped = await wasHighDivSkipped(rec.runId);
+
   // 갈아타기 추천이면 매도→매수를 한 트랜잭션으로 (매도가 실패하면 매수도 안 된다)
   if (rec.sellTicker) {
     try {
@@ -427,6 +430,7 @@ export async function acceptRecommendationAction(formData: FormData) {
           unitPrice: positiveNum(formData.get("unitPrice"), "체결 단가"),
         },
         recommendationId: rec.id,
+        allowHighDivTransfer: highDivSkipped,
       });
     } catch (e) {
       const dup = duplicateRecommendationMessage(e);
@@ -439,9 +443,6 @@ export async function acceptRecommendationAction(formData: FormData) {
     revalidatePath("/");
     return { ok: true };
   }
-
-  // 같은 회차에서 고배당을 건너뛰었다면 그 잔액을 끌어와 쓸 수 있다 (§2.2 예외)
-  const highDivSkipped = await wasHighDivSkipped(rec.runId);
 
   try {
     await addPurchaseWithHighDivTransfer(

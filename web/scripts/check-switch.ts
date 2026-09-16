@@ -1,5 +1,5 @@
 /**
- * 갈아타기 묶음 삭제·취소 검증 (§5 A3). 검증용 DB에서만 실행할 것 — 테이블을 비운다.
+ * 갈아타기 묶음 삭제·취소·매수 잔액 검증 (§5 A3). 검증용 DB에서만 실행할 것 — 테이블을 비운다.
  *   DATABASE_URL=<test db> pnpm exec tsx scripts/check-switch.ts
  */
 import { sql } from "drizzle-orm";
@@ -23,6 +23,7 @@ import {
   executeSwitch,
   listPurchases,
 } from "../src/domain/purchases";
+import { allocateBudgets, computeRefQty } from "../src/domain/recommendation";
 
 let failed = 0;
 function check(label: string, actual: unknown, expected: unknown) {
@@ -345,6 +346,137 @@ async function main() {
   check("purchases 0행", c4.p, 0);
   check("ledger purchase 0행", c4.lp, 0);
   check("잔액 복원", (await getBalances()).div_growth, 900_000);
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log(
+    "\n=== 시나리오 6: 잔액+매도대금을 넘는 갈아타기 매수는 거부된다 ===",
+  );
+  await reset({ div_growth: 400_000, asset_growth: 0, high_div: 0 });
+  await addPurchase({
+    boughtAt: "2026-09-01",
+    category: "div_growth",
+    ticker: "379800",
+    etfName: "KODEX 미국S&P500",
+    qty: 20,
+    unitPrice: 20_000,
+  });
+  check("매입 후 잔액 0원", (await getBalances()).div_growth, 0);
+  const balBeforeOver = await getBalances();
+  const cBeforeOver = await counts();
+  const sellFive = { ticker: "379800", qty: 5, unitPrice: 20_000 };
+  const overMsg = await messageOf(() =>
+    executeSwitch({
+      category: "div_growth",
+      executedAt: "2026-09-16",
+      sell: sellFive,
+      buy: {
+        ticker: "490600",
+        etfName: "PLUS 고배당주",
+        qty: 11,
+        unitPrice: 10_000,
+      },
+    }),
+  );
+  check(
+    "거부 메시지",
+    overMsg,
+    "배당성장 잔액+매도대금(100,000원)보다 큰 매수입니다 (매수 110,000원) — 수량을 줄이세요",
+  );
+  check("행 수 불변(매도까지 롤백)", await counts(), cBeforeOver);
+  check("잔액 불변", await getBalances(), balBeforeOver);
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log("\n--- 대조군: 잔액+매도대금에 딱 맞는 매수는 통과한다 ---");
+  const exactMsg = await messageOf(() =>
+    executeSwitch({
+      category: "div_growth",
+      executedAt: "2026-09-16",
+      sell: sellFive,
+      buy: {
+        ticker: "490600",
+        etfName: "PLUS 고배당주",
+        qty: 10,
+        unitPrice: 10_000,
+      },
+    }),
+  );
+  check("예외 없음", exactMsg, null);
+  const c7 = await counts();
+  check("purchases 2행", c7.p, 2);
+  check("sales 1행", c7.s, 1);
+  check("ledger sell 1행", c7.ls, 1);
+  check("ledger purchase 2행", c7.lp, 2);
+  check("매수 후 잔액 0원", (await getBalances()).div_growth, 0);
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log(
+    "\n=== 시나리오 7: 고배당 건너뜀 회차의 갈아타기(예산 > 잔액)는 이전 2행과 함께 통과한다 ===",
+  );
+  await reset({ div_growth: 400_000, asset_growth: 0, high_div: 160_000 });
+  await addPurchase({
+    boughtAt: "2026-09-01",
+    category: "div_growth",
+    ticker: "379800",
+    etfName: "KODEX 미국S&P500",
+    qty: 20,
+    unitPrice: 20_000,
+  });
+  const balSkipped = await getBalances();
+  const budgets = allocateBudgets(balSkipped, {
+    div_growth: false,
+    asset_growth: false,
+    high_div: true,
+  });
+  check("재배분 예산", budgets.div_growth, 100_000);
+  check("예산이 실제 잔액보다 크다", budgets.div_growth > balSkipped.div_growth, true);
+  const proceeds = sellFive.qty * sellFive.unitPrice;
+  const buyQty = computeRefQty(budgets.div_growth, proceeds, 10_000);
+  check("추천 수량(예산+매도대금 기준)", buyQty, 20);
+  const skippedSwitch = {
+    category: "div_growth" as const,
+    executedAt: "2026-09-16",
+    sell: sellFive,
+    buy: {
+      ticker: "490600",
+      etfName: "PLUS 고배당주",
+      qty: buyQty,
+      unitPrice: 10_000,
+    },
+  };
+
+  const noFlagMsg = await messageOf(() => executeSwitch(skippedSwitch));
+  check(
+    "이전 허용 없이는 거부",
+    noFlagMsg,
+    "배당성장 잔액+매도대금(100,000원)보다 큰 매수입니다 (매수 200,000원) — 수량을 줄이세요",
+  );
+  check("거부 후 이전 행 0건", await transferRowCount(), 0);
+  check("거부 후 잔액 불변", await getBalances(), balSkipped);
+
+  const sw7 = await executeSwitch({ ...skippedSwitch, allowHighDivTransfer: true });
+  check("이전 후 잔액", await getBalances(), {
+    div_growth: 0,
+    asset_growth: 0,
+    high_div: 60_000,
+  });
+  check(
+    "매수에 달린 원장 3행(purchase 1 + adjust 2)",
+    await ledgerRefCount(sw7.purchase.id),
+    3,
+  );
+  check("이전 행 2건", await transferRowCount(), 2);
+  check(
+    "묶음 원장 4행(sell 1 + purchase 1 + adjust 2)",
+    await groupLedgerCount(sw7.switchGroupId),
+    4,
+  );
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  const cancelled7 = await cancelSwitch(sw7.switchGroupId);
+  check("취소 행 수", cancelled7, { purchases: 1, sales: 1 });
+  check("취소 후 이전 행 0건", await transferRowCount(), 0);
+  check("취소 후 묶음 원장 0행", await groupLedgerCount(sw7.switchGroupId), 0);
+  check("취소 후 잔액 복원", await getBalances(), balSkipped);
   check("고아 원장 0행", await orphanCount(), 0);
 
   await db.execute(

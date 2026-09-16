@@ -28,10 +28,7 @@ export type PurchaseInput = {
  * 매입 기록 + 원장 차감을 한 트랜잭션으로 (§7).
  * 잔액은 저장하지 않으므로 여기서 재계산할 것이 없다.
  */
-/** 매입 코어 — 주어진 트랜잭션 안에서 실행한다 (executeSwitch 가 재사용). */
-export async function addPurchaseTx(tx: Tx, input: PurchaseInput) {
-  const amount = input.qty * input.unitPrice;
-
+async function insertPurchaseTx(tx: Tx, input: PurchaseInput, amount: number) {
   const [row] = await tx
     .insert(purchases)
     .values({
@@ -47,17 +44,41 @@ export async function addPurchaseTx(tx: Tx, input: PurchaseInput) {
       memo: input.memo ?? null,
     })
     .returning();
+  return row;
+}
 
+async function insertPurchaseLedgerTx(
+  tx: Tx,
+  input: PurchaseInput,
+  amount: number,
+  purchaseId: number,
+) {
+  await tx.insert(ledger).values({
+    type: "purchase",
+    category: input.category,
+    amountKrw: -amount,
+    refPurchaseId: purchaseId,
+    memo: `${input.etfName} ${input.qty}주`,
+  });
+}
+
+async function categoryBalanceTx(tx: Tx, c: Category) {
+  const [row] = await tx
+    .select({
+      v: sql<number>`coalesce(sum(${ledger.amountKrw}), 0)::int`,
+    })
+    .from(ledger)
+    .where(eq(ledger.category, c));
+  return Number(row?.v ?? 0);
+}
+
+/** 매입 코어 — 주어진 트랜잭션 안에서 실행한다 (addPurchase 가 감싼다). */
+export async function addPurchaseTx(tx: Tx, input: PurchaseInput) {
+  const amount = input.qty * input.unitPrice;
+  const row = await insertPurchaseTx(tx, input, amount);
   if (!input.skipLedger) {
-    await tx.insert(ledger).values({
-      type: "purchase",
-      category: input.category,
-      amountKrw: -amount,
-      refPurchaseId: row.id,
-      memo: `${input.etfName} ${input.qty}주`,
-    });
+    await insertPurchaseLedgerTx(tx, input, amount, row.id);
   }
-
   return row;
 }
 
@@ -138,82 +159,67 @@ export async function addPurchaseWithHighDivTransfer(
   input: PurchaseInput,
   opts: { allowTransfer: boolean },
 ) {
+  return db.transaction((tx) =>
+    addPurchaseWithTransferTx(tx, input, {
+      allowTransfer: opts.allowTransfer,
+      overMessage: (own) =>
+        `${CATEGORY_LABEL[input.category]} 잔액(${own.toLocaleString("ko-KR")}원)보다 큰 금액입니다 — 수량을 1주 줄이거나 실제 체결금액에 맞추세요`,
+    }),
+  );
+}
+
+type TransferPurchaseOpts = {
+  allowTransfer: boolean;
+  overMessage: (balance: number, amount: number) => string;
+};
+
+export async function addPurchaseWithTransferTx(
+  tx: Tx,
+  input: PurchaseInput,
+  opts: TransferPurchaseOpts,
+) {
   const amount = input.qty * input.unitPrice;
+  const own = await categoryBalanceTx(tx, input.category);
+  const shortfall = amount - own;
 
-  return db.transaction(async (tx) => {
-    const balanceOf = async (c: Category) => {
-      const [row] = await tx
-        .select({
-          v: sql<number>`coalesce(sum(${ledger.amountKrw}), 0)::int`,
-        })
-        .from(ledger)
-        .where(eq(ledger.category, c));
-      return Number(row?.v ?? 0);
-    };
-
-    const own = await balanceOf(input.category);
-    const shortfall = amount - own;
-
-    if (shortfall > 0) {
-      if (!opts.allowTransfer || input.category === "high_div") {
-        throw new Error(
-          `${CATEGORY_LABEL[input.category]} 잔액(${own.toLocaleString("ko-KR")}원)보다 큰 금액입니다 — 수량을 1주 줄이거나 실제 체결금액에 맞추세요`,
-        );
-      }
-      const pool = await balanceOf("high_div");
-      if (pool < shortfall) {
-        throw new Error(
-          `고배당 잔액(${pool.toLocaleString("ko-KR")}원)으로도 부족합니다`,
-        );
-      }
+  if (shortfall > 0) {
+    if (!opts.allowTransfer || input.category === "high_div") {
+      throw new Error(opts.overMessage(own, amount));
     }
+    const pool = await categoryBalanceTx(tx, "high_div");
+    if (pool < shortfall) {
+      throw new Error(
+        `고배당 잔액(${pool.toLocaleString("ko-KR")}원)으로도 부족합니다`,
+      );
+    }
+  }
 
-    const [row] = await tx
-      .insert(purchases)
-      .values({
-        boughtAt: input.boughtAt,
+  const row = await insertPurchaseTx(tx, input, amount);
+
+  if (shortfall > 0) {
+    // 이동은 두 행으로 남겨 어디서 왔는지 원장만 봐도 알 수 있게 한다.
+    // 매입 뒤에 넣어 refPurchaseId 를 채운다 — 매입을 지우면 이전도 함께 되돌아간다.
+    await tx.insert(ledger).values([
+      {
+        type: "adjust" as const,
+        category: "high_div" as const,
+        amountKrw: -shortfall,
+        refPurchaseId: row.id,
+        memo: `고배당 건너뜀 → ${CATEGORY_LABEL[input.category]} 이전`,
+      },
+      {
+        type: "adjust" as const,
         category: input.category,
-        ticker: input.ticker.trim(),
-        etfName: input.etfName.trim(),
-        qty: input.qty,
-        unitPrice: input.unitPrice,
-        amountKrw: amount,
-        recommendationId: input.recommendationId ?? null,
-        memo: input.memo ?? null,
-      })
-      .returning();
+        amountKrw: shortfall,
+        refPurchaseId: row.id,
+        memo: "고배당 건너뜀분 이전받음",
+      },
+    ]);
+  }
 
-    if (shortfall > 0) {
-      // 이동은 두 행으로 남겨 어디서 왔는지 원장만 봐도 알 수 있게 한다.
-      // 매입 뒤에 넣어 refPurchaseId 를 채운다 — 매입을 지우면 이전도 함께 되돌아간다.
-      await tx.insert(ledger).values([
-        {
-          type: "adjust" as const,
-          category: "high_div" as const,
-          amountKrw: -shortfall,
-          refPurchaseId: row.id,
-          memo: `고배당 건너뜀 → ${CATEGORY_LABEL[input.category]} 이전`,
-        },
-        {
-          type: "adjust" as const,
-          category: input.category,
-          amountKrw: shortfall,
-          refPurchaseId: row.id,
-          memo: "고배당 건너뜀분 이전받음",
-        },
-      ]);
-    }
+  await insertPurchaseLedgerTx(tx, input, amount, row.id);
 
-    await tx.insert(ledger).values({
-      type: "purchase",
-      category: input.category,
-      amountKrw: -amount,
-      refPurchaseId: row.id,
-      memo: `${input.etfName} ${input.qty}주`,
-    });
-
-    return row;
-  });
+  return row;
 }
 
 /** 매입 수정 — 연결된 원장 행을 같은 트랜잭션에서 함께 고친다. */
@@ -490,6 +496,7 @@ export type SwitchInput = {
   buy: SwitchLeg & { etfName: string }; // 새로 살 종목 이름은 필수
   recommendationId?: number | null;
   memo?: string | null;
+  allowHighDivTransfer?: boolean;
 };
 
 /**
@@ -519,17 +526,25 @@ export async function executeSwitch(input: SwitchInput) {
       memo: input.memo ?? "갈아타기 매도",
     });
 
-    const purchase = await addPurchaseTx(tx, {
-      boughtAt: date,
-      category: input.category,
-      ticker: input.buy.ticker,
-      etfName: input.buy.etfName,
-      qty: input.buy.qty,
-      unitPrice: input.buy.unitPrice,
-      switchGroupId,
-      recommendationId: input.recommendationId ?? null,
-      memo: input.memo ?? "갈아타기 매수",
-    });
+    const purchase = await addPurchaseWithTransferTx(
+      tx,
+      {
+        boughtAt: date,
+        category: input.category,
+        ticker: input.buy.ticker,
+        etfName: input.buy.etfName,
+        qty: input.buy.qty,
+        unitPrice: input.buy.unitPrice,
+        switchGroupId,
+        recommendationId: input.recommendationId ?? null,
+        memo: input.memo ?? "갈아타기 매수",
+      },
+      {
+        allowTransfer: input.allowHighDivTransfer ?? false,
+        overMessage: (available, amount) =>
+          `${CATEGORY_LABEL[input.category]} 잔액+매도대금(${available.toLocaleString("ko-KR")}원)보다 큰 매수입니다 (매수 ${amount.toLocaleString("ko-KR")}원) — 수량을 줄이세요`,
+      },
+    );
 
     return { switchGroupId, sale, purchase };
   });

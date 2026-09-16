@@ -33,7 +33,6 @@ export default function AcceptForm({
   );
 
   // 1주도 못 사는데 폼을 그리면 기본값이 없는 수량을 채워 넣게 된다.
-  // 갈아타기 경로에는 잔액 검증이 없어 그대로 원장이 음수가 된다.
   if (defaultQty <= 0) {
     return (
       <p className="mt-3 border-t border-neutral-100 pt-3 text-sm text-amber-700">
