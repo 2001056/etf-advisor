@@ -8,6 +8,7 @@
  * - 여러 종목을 한 번의 요청으로 (네이버 폴링 API가 콤마 구분을 지원)
  * - 실패하거나 느리면 조용히 포기하고 조사 문서 값으로 되돌아간다 (대시보드를 막지 않는다)
  * - 짧게 캐시해 새로고침마다 때리지 않는다
+ * - 공식 API(느리고 전일 기준)는 렌더를 막지 않고 백그라운드로 받아 NAV·괴리율만 덧붙인다
  */
 
 import { getOfficialQuotes, hasOfficialKey } from "./officialQuote";
@@ -17,6 +18,8 @@ const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const TIMEOUT_MS = 2500;
 const CACHE_TTL_MS = 30_000;
+/** 공식 API(공공데이터포털)는 전 영업일 종가·NAV라 30초 캐시가 의미 없다. 6시간 캐시. */
+const OFFICIAL_TTL_MS = 6 * 60 * 60 * 1000;
 
 export type LivePrice = {
   ticker: string;
@@ -49,6 +52,46 @@ export type RealtimePrice = {
 
 type CacheEntry = { at: number; value: LivePrice };
 const cache = new Map<string, CacheEntry>();
+
+/** 공식 API에서 받은 NAV·괴리율·기준일. 가격은 여기서 쓰지 않는다(전일 종가라 장중엔 묵은 값). */
+type OfficialEntry = {
+  at: number;
+  nav: number | null;
+  premium: number | null;
+  baseDate?: string;
+};
+const officialCache = new Map<string, OfficialEntry>();
+const officialInflight = new Set<string>();
+
+/**
+ * 공식 API를 백그라운드로 갱신한다 — 종목별 병렬, 실패는 조용히, 같은 종목 중복 호출 방지.
+ * 대시보드는 이 결과를 기다리지 않고, 다음 렌더부터 캐시에 있는 값을 붙여 보여준다.
+ * (이전에는 렌더가 종목별 순차 호출을 기다려 종목당 1~5초씩 막혔다 — 2026-09-16 실측)
+ */
+function refreshOfficialInBackground(tickers: string[]): void {
+  const targets = tickers.filter((t) => !officialInflight.has(t));
+  if (targets.length === 0) return;
+  for (const t of targets) officialInflight.add(t);
+  void Promise.allSettled(
+    targets.map(async (t) => {
+      try {
+        const q = (await getOfficialQuotes([t])).get(t);
+        if (q) {
+          officialCache.set(t, {
+            at: Date.now(),
+            nav: q.nav,
+            premium: q.premium,
+            baseDate: q.baseDate,
+          });
+        }
+      } catch {
+        // 공식 API 실패·타임아웃은 조용히. 다음 렌더 때 다시 시도한다.
+      } finally {
+        officialInflight.delete(t);
+      }
+    }),
+  );
+}
 const realtimeCache = new Map<string, { at: number; value: RealtimePrice }>();
 
 function parseKrw(v: unknown): number | null {
@@ -80,49 +123,40 @@ export async function getLivePrices(
     else missing.push(t);
   }
 
-  if (missing.length === 0) return out;
-
-  // 공식 API 우선 (키가 있을 때만)
-  if (hasOfficialKey()) {
-    try {
-      const official = await getOfficialQuotes(missing);
-      for (const [ticker, q] of official) {
-        const value: LivePrice = {
-          ticker,
-          price: q.price,
-          nav: q.nav,
-          premium: q.premium,
-          source: "official",
-          change: q.change,
-          // 공식 API는 전 영업일 종가라 장중 상태가 없다
-          marketStatus: null,
-          baseDate: q.baseDate,
-          tradedAt: new Date(),
-        };
-        cache.set(ticker, { at: now, value });
-        out.set(ticker, value);
-      }
-    } catch {
-      // 공식 API 실패 — 아래 네이버로 진행
+  // 1) 네이버 — 한 번의 요청으로 즉시. 대시보드를 막지 않는다.
+  if (missing.length > 0) {
+    for (const [ticker, r] of await fetchNaver(missing)) {
+      const value: LivePrice = {
+        ticker,
+        price: r.price,
+        change: r.change,
+        marketStatus: r.marketStatus,
+        tradedAt: r.pricedAt,
+        source: "naver",
+        nav: null,
+        premium: null,
+      };
+      cache.set(ticker, { at: now, value });
+      out.set(ticker, value);
     }
   }
 
-  const stillMissing = missing.filter((t) => !out.has(t));
-  if (stillMissing.length === 0) return out;
-
-  for (const [ticker, r] of await fetchNaver(stillMissing)) {
-    const value: LivePrice = {
-      ticker,
-      price: r.price,
-      change: r.change,
-      marketStatus: r.marketStatus,
-      tradedAt: r.pricedAt,
-      source: "naver",
-      nav: null,
-      premium: null,
-    };
-    cache.set(ticker, { at: now, value });
-    out.set(ticker, value);
+  // 2) 공식 API의 NAV·괴리율은 캐시에 있으면 붙이고, 없거나 낡았으면 백그라운드로 갱신한다.
+  //    가격 자체는 네이버 값을 유지한다(공식 API는 전 영업일 종가).
+  if (hasOfficialKey()) {
+    const stale = wanted.filter((t) => {
+      const o = officialCache.get(t);
+      return !o || now - o.at >= OFFICIAL_TTL_MS;
+    });
+    if (stale.length > 0) refreshOfficialInBackground(stale);
+    for (const [t, v] of out) {
+      const o = officialCache.get(t);
+      if (o) {
+        v.nav = o.nav;
+        v.premium = o.premium;
+        v.baseDate = o.baseDate;
+      }
+    }
   }
 
   return out;

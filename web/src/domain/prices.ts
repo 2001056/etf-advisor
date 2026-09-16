@@ -61,10 +61,11 @@ export async function snapshotPrices(tickers: string[]): Promise<number> {
         ticker,
         date: today,
         close: Math.round(q.price),
-        nav: q.nav === null || q.nav === undefined ? null : Math.round(q.nav),
-        premiumBp: toBp(q.premium),
+        // 네이버 현재가 행에 전일 기준 공식 NAV를 섞으면 괴리율이 어긋난다 — 공식 값은 위 official 행에서만
+        nav: null,
+        premiumBp: null,
         volume: null,
-        source: q.source ?? "naver",
+        source: "naver",
       });
     }
   }

@@ -747,28 +747,18 @@ export default async function DashboardPage() {
             <p className="mt-3 text-xs text-neutral-500">
               {anyLive ? (
                 <>
-                  {liveAt?.source === "official" ? (
+                  현재가는 화면을 열 때 네이버 금융에서 가져옵니다
+                  {liveAt && (
                     <>
-                      현재가는 공공데이터포털(금융위원회) 공식 시세입니다
-                      {liveAt.baseDate && ` — ${liveAt.baseDate.slice(0, 4)}-${liveAt.baseDate.slice(4, 6)}-${liveAt.baseDate.slice(6, 8)} 종가 기준`}
-                      . NAV를 함께 받아 괴리율을 직접 계산합니다
-                    </>
-                  ) : (
-                    <>
-                      현재가는 화면을 열 때 네이버 금융에서 가져옵니다
-                      {liveAt && (
-                        <>
-                          {" "}
-                          (
-                          {new Intl.DateTimeFormat("ko-KR", {
-                            timeZone: "Asia/Seoul",
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          }).format(liveAt.tradedAt)}{" "}
-                          기준
-                          {liveAt.marketStatus === "OPEN" ? " · 장중" : " · 장마감"})
-                        </>
-                      )}
+                      {" "}
+                      (
+                      {new Intl.DateTimeFormat("ko-KR", {
+                        timeZone: "Asia/Seoul",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      }).format(liveAt.tradedAt)}{" "}
+                      기준
+                      {liveAt.marketStatus === "OPEN" ? " · 장중" : " · 장마감"})
                     </>
                   )}
                   . 30초간 캐시하며, 못 가져온 종목은 <b>(문서)</b> 표시와 함께
