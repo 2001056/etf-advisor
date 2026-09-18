@@ -3,16 +3,25 @@
  *   pnpm run check:recommend
  */
 import {
+  activeBalances,
+  activeCategories,
+  activeCategoriesLine,
+  activeHoldings,
   allocateBudgets,
   applyRealtimePrices,
+  budgetLine,
   computeRefQty,
   extractJson,
+  holdingLine,
   isDrift,
   normalizePicks,
   positiveInt,
+  recommendOutputRules,
+  researchTickers,
   toInt,
 } from "../src/domain/recommendation";
 import { Category, isMarketOpenKST } from "../src/domain/money";
+import { buildFormatInstruction, parseResearchDoc } from "../src/domain/docFormat";
 
 let failed = 0;
 function check(label: string, actual: unknown, expected: unknown) {
@@ -447,6 +456,368 @@ check("일요일 11:00", isMarketOpenKST(new Date("2026-09-20T11:00:00+09:00")),
 // UTC로 들어와도 KST로 환산해서 본다 — 2026-09-15 01:00Z = KST 10:00
 check("UTC 입력도 KST 기준", isMarketOpenKST(new Date("2026-09-15T01:00:00Z")), true);
 check("KST 자정", isMarketOpenKST(new Date("2026-09-15T00:00:00+09:00")), false);
+
+console.log("\n=== 활성 카테고리 = 월 충전액 > 0 (잔액은 보지 않는다) ===");
+const zero: Record<Category, number> = { div_growth: 0, asset_growth: 0, high_div: 0 };
+check(
+  "충전 0/50만/0 → 자산성장만",
+  activeCategories({ div_growth: 0, asset_growth: 500_000, high_div: 0 }),
+  ["asset_growth"],
+);
+check("전부 0이면 세 개 전부", activeCategories(zero), [
+  "div_growth",
+  "asset_growth",
+  "high_div",
+]);
+check(
+  "대조군: 충전 28만/28만/14만이면 세 개 모두 활성",
+  activeCategories({ div_growth: 280_000, asset_growth: 280_000, high_div: 140_000 }),
+  ["div_growth", "asset_growth", "high_div"],
+);
+check(
+  "대조군: 충전 20만/0/10만이면 배당성장·고배당",
+  activeCategories({ div_growth: 200_000, asset_growth: 0, high_div: 100_000 }),
+  ["div_growth", "high_div"],
+);
+check(
+  "활성 줄",
+  activeCategoriesLine(["asset_growth"]),
+  "[이번 회차 활성 카테고리: 자산성장]",
+);
+check(
+  "활성 줄 (세 개)",
+  activeCategoriesLine(["div_growth", "asset_growth", "high_div"]),
+  "[이번 회차 활성 카테고리: 배당성장·자산성장·고배당]",
+);
+
+console.log("\n=== ② 재조사 대상: 활성 카테고리 문서 행 ∪ 활성 카테고리 보유 ===");
+const activeDoc = parseResearchDoc(`---
+run_id: 1
+date: 2026-09-18
+type: scheduled
+tickers: [446720, 133690, 490600, 999990]
+---
+## 1. 요약
+요약
+## 2. 시장 개관
+개관
+## 3. 카테고리별 ETF 현황
+현황
+## 4. 데이터 표
+| ticker | name | category | price | dist_yield | premium | note |
+|---|---|---|---|---|---|---|
+| 446720 | SOL 미국배당다우존스 | 배당성장 | 14000 | 3.5 | 0.1 | - |
+| 133690 | TIGER 미국나스닥100 | 자산성장 | 150000 | 0.3 | 0.0 | - |
+| 490600 | RISE 커버드콜 | 고배당 | 10000 | 10.0 | 0.1 | - |
+| 111110 | 가상 채권 | 채권 | 1000 | 1.0 | 0.0 | - |
+## 5. 이벤트·뉴스
+없음
+## 6. 리스크 신호
+없음
+## 7. 출처
+없음
+`);
+const heldAll: { category: Category; ticker: string }[] = [
+  { category: "div_growth", ticker: "446720" },
+  { category: "high_div", ticker: "490600" },
+  { category: "asset_growth", ticker: "379800" },
+];
+const assetOnly = researchTickers([activeDoc], heldAll, ["asset_growth"]);
+check("자산성장만: 문서 자산성장 행 + 자산성장 보유", assetOnly, ["133690", "379800"]);
+check(
+  "비활성 보유(446720·490600)는 빠진다",
+  assetOnly.filter((t) => ["446720", "490600"].includes(t)),
+  [],
+);
+check("알 수 없는 카테고리 행은 빠진다", assetOnly.includes("111110"), false);
+check("category를 모르는 frontmatter 전용 티커는 빠진다", assetOnly.includes("999990"), false);
+check(
+  "두 개 활성: 배당성장·자산성장",
+  researchTickers([activeDoc], heldAll, ["div_growth", "asset_growth"]),
+  ["446720", "133690", "379800"],
+);
+check(
+  "대조군: 세 개 전부 활성이면 기존 식(문서 전 종목 ∪ 보유 전부)과 같다",
+  researchTickers([activeDoc], heldAll, ["div_growth", "asset_growth", "high_div"]),
+  ["446720", "133690", "490600", "999990", "111110", "379800"],
+);
+
+console.log("\n=== 잔돈 케이스: 충전 0/50만/0 + 잔액 8,335/500,000/0 ===");
+// 비활성 카테고리에 1주도 못 사는 잔돈(갈아타기 차액·분배금)이 남아도 되살아나면 안 된다
+const dustTopup = { div_growth: 0, asset_growth: 500_000, high_div: 0 };
+const dustBalances = { div_growth: 8_335, asset_growth: 500_000, high_div: 0 };
+const dustHoldings = [
+  { category: "div_growth" as Category, ticker: "446720", etfName: "SOL 미국배당다우존스", qty: 10, avgPrice: 13_500 },
+  { category: "asset_growth" as Category, ticker: "379800", etfName: "KODEX 미국S&P500", qty: 5, avgPrice: 20_000 },
+];
+const dustActive = activeCategories(dustTopup);
+check("활성 = 자산성장만", dustActive, ["asset_growth"]);
+check(
+  "researchTickers 에 배당성장 보유 446720 없음",
+  researchTickers([activeDoc], dustHoldings, dustActive).includes("446720"),
+  false,
+);
+check(
+  "배당성장 잔액 줄에 매수 안 함 표시",
+  budgetLine("div_growth", dustBalances.div_growth, dustActive),
+  "- 배당성장: 8,335원 (이번 회차 매수 안 함)",
+);
+check(
+  "배당성장 보유 줄에 매수 대상 아님 표시",
+  holdingLine(dustHoldings[0], dustActive),
+  "- 배당성장 | 446720 SOL 미국배당다우존스 | 10주 | 평단가 13,500원 (이번 회차 매수 대상 아님)",
+);
+check(
+  "자산성장 보유 줄은 표시 없음",
+  holdingLine(dustHoldings[1], dustActive),
+  "- 자산성장 | 379800 KODEX 미국S&P500 | 5주 | 평단가 20,000원",
+);
+check("정규화 잔액: 비활성은 0", activeBalances(dustBalances, dustActive), {
+  div_growth: 0,
+  asset_growth: 500_000,
+  high_div: 0,
+});
+check("정규화 보유: 활성만", activeHoldings(dustHoldings, dustActive), [
+  { category: "asset_growth", ticker: "379800", qty: 5 },
+]);
+const dustSwitch = {
+  picks: [
+    { category: "배당성장", action: "switch", ticker: "402970", etf_name: "A", ref_price: 12_000, ref_qty: 12, sell_ticker: "446720", sell_qty: 10, sell_ref_price: 14_000, rationale: "", source_doc_ids: [], source_urls: [] },
+    { category: "자산성장", action: "buy", ticker: "379800", etf_name: "KODEX 미국S&P500", ref_price: 22_000, ref_qty: 22, rationale: "", source_doc_ids: [], source_urls: [] },
+  ],
+};
+const dustNorm = normalizePicks(dustSwitch, {
+  balances: activeBalances(dustBalances, dustActive),
+  injectedDocIds: [],
+  holdings: activeHoldings(dustHoldings, dustActive),
+  active: dustActive,
+});
+check("배당성장 switch pick 은 건너뜀", dustNorm.rows[0].skipped, true);
+check("  매도 없음", dustNorm.rows[0].sellTicker, null);
+check("  수량 0", dustNorm.rows[0].refQty, 0);
+check(
+  "  사유: 매수 대상이 아닌 카테고리",
+  dustNorm.dropped.some((d) => d.startsWith("이번 회차 매수 대상이 아닌 카테고리라 갈아타기를 적용하지 않음")),
+  true,
+);
+check("자산성장 매수는 그대로: floor(500000/22000)", dustNorm.rows[1].refQty, 22);
+// 방어 층을 하나씩만 남겨도 막혀야 한다 — active 를 빼고 잔액 0·보유 필터만으로
+const dustNoActive = normalizePicks(dustSwitch, {
+  balances: activeBalances(dustBalances, dustActive),
+  injectedDocIds: [],
+  holdings: activeHoldings(dustHoldings, dustActive),
+});
+check("active 없이도 잔액 0·보유 필터로 건너뜀", dustNoActive.rows[0].skipped, true);
+const dustActiveOnly = normalizePicks(dustSwitch, {
+  balances: dustBalances,
+  injectedDocIds: [],
+  holdings: dustHoldings,
+  active: dustActive,
+});
+check("잔액·보유를 그대로 넘겨도 active 로 건너뜀", dustActiveOnly.rows[0].skipped, true);
+const dustUnguarded = normalizePicks(dustSwitch, {
+  balances: dustBalances,
+  injectedDocIds: [],
+  holdings: dustHoldings,
+});
+check(
+  "대조군: 세 겹을 다 빼면 잔돈+매도대금으로 갈아타기가 성립",
+  [dustUnguarded.rows[0].skipped, dustUnguarded.rows[0].sellTicker],
+  [false, "446720"],
+);
+
+console.log("\n=== 고배당 건너뜀 재배분이 비활성 카테고리로 흐르지 않는다 ===");
+const reallocNorm = normalizePicks(
+  {
+    picks: [
+      { category: "고배당", action: "skip", ticker: null, etf_name: null, ref_price: null, ref_qty: 0, rationale: "", source_doc_ids: [], source_urls: [] },
+      { category: "배당성장", action: "buy", ticker: "446720", etf_name: "A", ref_price: 14_000, ref_qty: 1, rationale: "", source_doc_ids: [], source_urls: [] },
+    ],
+  },
+  {
+    balances: activeBalances({ div_growth: 0, asset_growth: 0, high_div: 160_000 }, ["asset_growth", "high_div"]),
+    injectedDocIds: [],
+    active: ["asset_growth", "high_div"],
+  },
+);
+check("비활성 배당성장 매수는 건너뜀", reallocNorm.rows[1].skipped, true);
+check("  배정 0", reallocNorm.rows[1].budgetKrw, 0);
+const reallocLeak = normalizePicks(
+  {
+    picks: [
+      { category: "고배당", action: "skip", ticker: null, etf_name: null, ref_price: null, ref_qty: 0, rationale: "", source_doc_ids: [], source_urls: [] },
+      { category: "배당성장", action: "buy", ticker: "446720", etf_name: "A", ref_price: 11_000, ref_qty: 1, rationale: "", source_doc_ids: [], source_urls: [] },
+    ],
+  },
+  {
+    balances: activeBalances({ div_growth: 0, asset_growth: 0, high_div: 160_000 }, ["asset_growth", "high_div"]),
+    injectedDocIds: [],
+  },
+);
+check(
+  "대조군: active 를 안 넘기면 재배분 10만(5/8)이 비활성 배당성장으로 흘러 매수가 성립",
+  [reallocLeak.rows[1].skipped, reallocLeak.rows[1].budgetKrw, reallocLeak.rows[1].refQty],
+  [false, 100_000, 9],
+);
+
+console.log("\n=== ③ 출력 규칙: 세 개 활성이면 HEAD 원문과 한 글자도 다르지 않다 ===");
+// git show HEAD:web/src/server/orchestrator.ts 의 [출력 규칙] 10줄 원문
+const HEAD_OUTPUT_RULES = [
+  "- 세 카테고리(배당성장·자산성장·고배당) 각각 정확히 한 번씩, 총 3개를 picks에 담아라.",
+  "- 매수면 action=\"buy\", 건너뜀이면 action=\"skip\", 보유 종목을 팔고 다른 종목으로 교체하는 게 낫다고 판단되면 action=\"switch\".",
+  "- action=skip이면 ticker·etf_name·ref_price는 null, ref_qty는 0으로 둔다. 값을 지어내지 마라.",
+  "- action=switch이면 sell_ticker=팔 보유 종목 코드, sell_qty=팔 수량(위 보유 현황의 수량 이내), sell_ref_price=그 종목의 조사 가격. ticker·etf_name·ref_price에는 새로 살 종목을 적는다. 갈아타기의 근거(왜 파는지, 왜 그 종목으로 가는지)를 rationale에 조사 수치를 인용해 설명하라.",
+  "- action이 buy나 skip이면 sell_ticker·sell_qty·sell_ref_price는 null로 둔다.",
+  "- 보유하지 않은 종목을 팔라고 하지 마라. 갈아타기는 위 [현재 보유 현황]에 있는 종목만 대상으로 한다.",
+  "- ref_price는 위 매입 시점 조사 문서의 price를 그대로 쓴다.",
+  "- ref_qty: buy면 floor(budget_krw ÷ ref_price), switch면 floor((budget_krw + sell_qty×sell_ref_price) ÷ ref_price).",
+  "- source_doc_ids에는 위에 표시된 research_doc_id 중 실제로 근거로 쓴 것만 넣어라.",
+  "- JSON 밖에는 아무것도 출력하지 마라.",
+];
+const ALL: Category[] = ["div_growth", "asset_growth", "high_div"];
+check("대조군: 세 개 활성 = HEAD 10줄", recommendOutputRules(ALL, false), HEAD_OUTPUT_RULES);
+const rulesAsset = recommendOutputRules(["asset_growth"], true);
+check(
+  "자산성장만",
+  rulesAsset[0],
+  "- 이번 회차 활성 카테고리는 자산성장뿐이다. 자산성장 한 개만 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.",
+);
+check(
+  "비활성 보유가 있으면 갈아타기 제외 문구",
+  rulesAsset[5],
+  `${HEAD_OUTPUT_RULES[5]} (이번 회차 매수 대상 아님) 표시가 붙은 종목은 팔거나 갈아타지 않는다.`,
+);
+check("  나머지 8줄은 HEAD 그대로", [...rulesAsset.slice(1, 5), ...rulesAsset.slice(6)], [...HEAD_OUTPUT_RULES.slice(1, 5), ...HEAD_OUTPUT_RULES.slice(6)]);
+check(
+  "대조군: 비활성 보유가 없으면 갈아타기 문구 그대로",
+  recommendOutputRules(["asset_growth"], false)[5],
+  HEAD_OUTPUT_RULES[5],
+);
+check(
+  "두 개 활성",
+  recommendOutputRules(["div_growth", "asset_growth"], false)[0],
+  "- 이번 회차 활성 카테고리는 배당성장·자산성장뿐이다. 배당성장·자산성장 각각 정확히 한 번씩, 총 2개를 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.",
+);
+check(
+  "대조군: 세 개 활성이면 잔액·보유 줄도 HEAD 형식 그대로(표시 없음)",
+  [budgetLine("high_div", 140_000, ALL), holdingLine(dustHoldings[0], ALL)],
+  ["- 고배당: 140,000원", "- 배당성장 | 446720 SOL 미국배당다우존스 | 10주 | 평단가 13,500원"],
+);
+check(
+  "대조군: 세 개 활성이면 정규화 잔액·보유도 그대로",
+  [activeBalances(balances, ALL), activeHoldings(dustHoldings, ALL).length],
+  [balances, 2],
+);
+
+console.log("\n=== 자산성장만 출력해도 정규화는 자산성장 1행, 잔액 전액 배정 ===");
+const assetBalances = { div_growth: 0, asset_growth: 500_000, high_div: 0 };
+const assetPick = normalizePicks(
+  {
+    picks: [
+      { category: "자산성장", action: "buy", ticker: "379800", etf_name: "KODEX 미국S&P500", ref_price: 22_000, ref_qty: 22, rationale: "", source_doc_ids: [], source_urls: [] },
+    ],
+  },
+  { balances: assetBalances, injectedDocIds: [], active: ["asset_growth"] },
+);
+check("1행", assetPick.rows.length, 1);
+check("자산성장", assetPick.rows[0].category, "asset_growth");
+check("잔액 전액 배정", assetPick.rows[0].budgetKrw, 500_000);
+check("수량 floor(500000/22000)", assetPick.rows[0].refQty, 22);
+check("버린 것 없음", assetPick.dropped.length, 0);
+
+console.log("\n=== 형식 지시문: 세 개 활성이면 HEAD 원문 스냅샷과 같다 ===");
+// git show HEAD:web/src/domain/docFormat.ts 의 buildFormatInstruction 을 아래 인자로 돌린 출력
+const HEAD_FORMAT_ONDEMAND = `
+────────────────────────────────
+[출력 형식 — 반드시 지킬 것]
+
+아래 형식으로만 출력하라. 헤딩 문구를 한 글자도 바꾸지 말고, 순서도 그대로 유지하라.
+프로그램이 이 문서를 기계적으로 읽으므로 형식이 틀리면 사용할 수 없다.
+조사 대상 종목(전원 빠짐없이 ## 4 표에 포함할 것): 446720, 133690
+
+---
+run_id: 7
+date: 2026-09-18
+type: ondemand
+tickers: [종목코드를 쉼표로 구분해 나열]
+model: (사용한 모델명)
+---
+
+## 1. 요약
+(3줄 이내)
+
+## 2. 시장 개관
+(코스피·S&P500·나스닥·원달러 환율·미 금리를 표로)
+
+## 3. 카테고리별 ETF 현황
+### 배당성장
+### 자산성장
+### 고배당
+(각 항목에 ETF별 현재가·최근 분배금·분배율·괴리율·특이사항)
+
+## 4. 데이터 표
+| ticker | name | category | price | dist_yield | total_return_1y | nav_trend | yield_basis | premium | note |
+|---|---|---|---|---|---|---|---|---|---|
+| 446720 | SOL 미국배당다우존스 | 배당성장 | 12345 | 3.5 | 14.2 | up | trailing12m | 0.1 | 비고 |
+
+이 표 규칙(가장 중요):
+- 컬럼은 위 10개 그대로, 순서도 그대로.
+- ticker는 앞의 0을 보존한 6자리 문자열.
+- price는 원 단위 정수만 (쉼표·"원" 금지). 나머지 비율은 % 기호 없는 숫자만.
+- category는 배당성장 / 자산성장 / 고배당 중 하나.
+- **total_return_1y**: 최근 1년 총투자수익률(기준가격 변동 + 분배금). 분배율과 나란히 비교하기 위한 값이다.
+- **nav_trend**: 최근 6~12개월 NAV 방향을 up / flat / down 중 하나로. 확인 불가면 NA.
+- **yield_basis**: 그 분배율이 어떤 기준으로 산출된 값인지.
+  trailing12m(후행 12개월 실지급) / annualized_1m(직전월 연율화) / target(목표분배율) / unknown 중 하나.
+  기준이 다르면 종목 간 분배율 비교가 성립하지 않으므로 반드시 확인해서 적어라.
+- 확인하지 못한 값은 지어내지 말고 NA로 적고, note에 이유와 마지막 확인일을 남겨라.
+
+## 5. 이벤트·뉴스
+(ETF별 bullet, 날짜 명기)
+
+## 6. 리스크 신호
+(없으면 "없음"이라고 명시)
+
+## 7. 출처
+(수치마다 근거 URL. 웹 검색으로 실제 확인한 것만 적을 것)
+`.trim();
+const fmtBase = {
+  type: "ondemand" as const,
+  dateKey: "2026-09-18",
+  runId: 7,
+  tickers: ["446720", "133690"],
+};
+check("대조군: 지정 없음(④ 경로) = HEAD", buildFormatInstruction(fmtBase) === HEAD_FORMAT_ONDEMAND, true);
+check("대조군: 세 개 지정 = HEAD", buildFormatInstruction({ ...fmtBase, categories: ALL }) === HEAD_FORMAT_ONDEMAND, true);
+const fmtAsset = buildFormatInstruction({ ...fmtBase, categories: ["asset_growth"] });
+check(
+  "자산성장만: 소제목",
+  fmtAsset.split("\n").filter((l) => l.startsWith("### ")),
+  ["### 자산성장"],
+);
+check(
+  "자산성장만: 예시 행이 자산성장",
+  fmtAsset.split("\n").filter((l) => /^\| \d{6} /.test(l)),
+  ["| 360750 | TIGER 미국S&P500 | 자산성장 | 12345 | 1.1 | 18.3 | up | trailing12m | 0.1 | 비고 |"],
+);
+check(
+  "고배당만: 예시 행이 고배당",
+  buildFormatInstruction({ ...fmtBase, categories: ["high_div"] })
+    .split("\n")
+    .filter((l) => /^\| \d{6} /.test(l))
+    .map((l) => l.split("|")[3].trim()),
+  ["고배당"],
+);
+check(
+  "자산성장만: 소제목·예시 행 말고는 HEAD 와 같다",
+  fmtAsset
+    .replace("### 자산성장", "### 배당성장\n### 자산성장\n### 고배당")
+    .replace(
+      "| 360750 | TIGER 미국S&P500 | 자산성장 | 12345 | 1.1 | 18.3 | up | trailing12m | 0.1 | 비고 |",
+      "| 446720 | SOL 미국배당다우존스 | 배당성장 | 12345 | 3.5 | 14.2 | up | trailing12m | 0.1 | 비고 |",
+    ) === HEAD_FORMAT_ONDEMAND,
+  true,
+);
 
 console.log(`\n=== 결과: ${failed === 0 ? "전부 통과" : `${failed}건 실패`} ===`);
 process.exit(failed === 0 ? 0 : 1);

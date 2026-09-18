@@ -1,3 +1,5 @@
+import { CATEGORIES, CATEGORY_LABEL, Category } from "./money";
+
 /**
  * 조사 문서 표준 형식 (기획서 §5.4).
  * 사용자가 쓰는 프롬프트 뒤에 시스템이 이 지시문을 자동으로 붙인다 —
@@ -65,16 +67,32 @@ export type ParsedDoc = {
   problems: string[];
 };
 
+const EXAMPLE_ROW: Record<Category, string> = {
+  div_growth:
+    "| 446720 | SOL 미국배당다우존스 | 배당성장 | 12345 | 3.5 | 14.2 | up | trailing12m | 0.1 | 비고 |",
+  asset_growth:
+    "| 360750 | TIGER 미국S&P500 | 자산성장 | 12345 | 1.1 | 18.3 | up | trailing12m | 0.1 | 비고 |",
+  high_div:
+    "| 161510 | PLUS 고배당주 | 고배당 | 12345 | 6.2 | 12.4 | flat | trailing12m | 0.1 | 비고 |",
+};
+
 /** 프롬프트 뒤에 붙는 출력 형식 지시문. */
 export function buildFormatInstruction(opts: {
   type: "scheduled" | "ondemand" | "watch";
   dateKey: string;
   runId: number;
   tickers?: string[];
+  categories?: Category[];
 }): string {
   const tickerLine = opts.tickers?.length
     ? `\n조사 대상 종목(전원 빠짐없이 ## 4 표에 포함할 것): ${opts.tickers.join(", ")}`
     : "";
+  const shown = CATEGORIES.filter(
+    (c) => !opts.categories?.length || opts.categories.includes(c),
+  );
+  const subheadings = shown.map((c) => `### ${CATEGORY_LABEL[c]}`).join("\n");
+  // 예시 행 카테고리를 모델이 그대로 따라 쓰는 경향이 있다 — 첫 활성 카테고리로 맞춘다
+  const exampleRow = EXAMPLE_ROW[shown[0]];
 
   return `
 ────────────────────────────────
@@ -98,15 +116,13 @@ model: (사용한 모델명)
 (코스피·S&P500·나스닥·원달러 환율·미 금리를 표로)
 
 ## 3. 카테고리별 ETF 현황
-### 배당성장
-### 자산성장
-### 고배당
+${subheadings}
 (각 항목에 ETF별 현재가·최근 분배금·분배율·괴리율·특이사항)
 
 ## 4. 데이터 표
 | ticker | name | category | price | dist_yield | total_return_1y | nav_trend | yield_basis | premium | note |
 |---|---|---|---|---|---|---|---|---|---|
-| 446720 | SOL 미국배당다우존스 | 배당성장 | 12345 | 3.5 | 14.2 | up | trailing12m | 0.1 | 비고 |
+${exampleRow}
 
 이 표 규칙(가장 중요):
 - 컬럼은 위 10개 그대로, 순서도 그대로.

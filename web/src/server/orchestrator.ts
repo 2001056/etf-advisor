@@ -11,7 +11,6 @@ import {
 import {
   buildFormatInstruction,
   parseResearchDoc,
-  tickersOf,
 } from "@/domain/docFormat";
 import {
   dateKeyKST,
@@ -20,14 +19,22 @@ import {
   CATEGORIES,
   Category,
 } from "@/domain/money";
-import { getBalances } from "@/domain/ledger";
+import { getBalances, getMonthlyTopup } from "@/domain/ledger";
 import { getHoldings } from "@/domain/purchases";
 // JSON 추출·정수 변환·pick 정규화는 순수 로직이라 분리했다.
 // 회귀 테스트: scripts/check-recommend.ts
 import {
+  activeBalances,
+  activeCategories,
+  activeCategoriesLine,
+  activeHoldings,
   applyRealtimePrices,
+  budgetLine,
   extractJson,
+  holdingLine,
   normalizePicks,
+  recommendOutputRules,
+  researchTickers,
 } from "@/domain/recommendation";
 import { getPrompt } from "@/domain/prompts";
 import { checkDocument, issuesToProblems } from "@/domain/dataChecks";
@@ -142,6 +149,7 @@ async function runResearch(opts: {
   trigger: "schedule" | "user";
   actionId: string | null;
   tickers?: string[];
+  categories?: Category[];
 }): Promise<{ runId: number; docId: number | null }> {
   const run = await claim(opts.slot, opts.trigger, opts.actionId);
   const startedAtMs = Date.now();
@@ -160,15 +168,20 @@ async function runResearch(opts: {
 
     const dateKey = dateKeyKST();
     const type = opts.slot === "weekly" ? "scheduled" : "ondemand";
-    const { body } = await getPrompt(opts.slot);
+    const [{ body }, categories] = await Promise.all([
+      getPrompt(opts.slot),
+      opts.categories ?? getMonthlyTopup().then(activeCategories),
+    ]);
 
     const prompt = [
       body,
+      ...(opts.slot === "purchase" ? [activeCategoriesLine(categories)] : []),
       buildFormatInstruction({
         type,
         dateKey,
         runId: run.id,
         tickers: opts.tickers,
+        categories,
       }),
     ].join("\n\n");
 
@@ -370,16 +383,21 @@ export async function docsForRecommendation() {
     .limit(12);
 }
 
-/** ②가 조사할 종목 = 주입 창 문서의 종목 ∪ 현재 보유 종목 (§5.2) */
-export async function tickersToResearch(): Promise<string[]> {
-  const docs = await docsForRecommendation();
-  const fromDocs = docs.flatMap((d) => tickersOf(parseResearchDoc(d.content)));
+/** ②가 조사할 종목 = 주입 창 문서의 활성 카테고리 종목 ∪ 활성 카테고리 보유 종목 (§5.2) */
+export async function tickersToResearch(active?: Category[]): Promise<string[]> {
+  const [docs, held, categories] = await Promise.all([
+    docsForRecommendation(),
+    db
+      .selectDistinct({ category: purchases.category, ticker: purchases.ticker })
+      .from(purchases),
+    active ?? getMonthlyTopup().then(activeCategories),
+  ]);
 
-  const held = await db
-    .selectDistinct({ ticker: purchases.ticker })
-    .from(purchases);
-
-  return [...new Set([...fromDocs, ...held.map((h) => h.ticker)])].filter(Boolean);
+  return researchTickers(
+    docs.map((d) => parseResearchDoc(d.content)),
+    held,
+    categories,
+  );
 }
 
 export type RecommendFlowResult = {
@@ -408,13 +426,16 @@ export function runRecommendFlow(
  */
 async function recommendFlow(): Promise<RecommendFlowResult> {
   const actionId = `act-${Date.now()}`;
-  const tickers = await tickersToResearch();
+  // ② 조사 대상과 ③ 잔액·보유 표시·정규화가 같은 기준을 보도록 흐름 입구에서 한 번만 정한다
+  const active = activeCategories(await getMonthlyTopup());
+  const tickers = await tickersToResearch(active);
 
   const research = await runResearch({
     slot: "purchase",
     trigger: "user",
     actionId,
     tickers,
+    categories: active,
   });
 
   if (!research.docId) {
@@ -450,29 +471,19 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
       getPrompt("recommend"),
     ]);
 
-    const KO: Record<Category, string> = {
-      div_growth: "배당성장",
-      asset_growth: "자산성장",
-      high_div: "고배당",
-    };
-
-    const budgetLines = CATEGORIES.map(
-      (c) => `- ${KO[c]}: ${balances[c].toLocaleString("ko-KR")}원`,
+    const budgetLines = CATEGORIES.map((c) =>
+      budgetLine(c, balances[c], active),
     ).join("\n");
 
     const holdingLines = holdings.length
-      ? holdings
-          .map(
-            (h) =>
-              `- ${KO[h.category]} | ${h.ticker} ${h.etfName} | ${h.qty}주 | 평단가 ${h.avgPrice.toLocaleString("ko-KR")}원`,
-          )
-          .join("\n")
+      ? holdings.map((h) => holdingLine(h, active)).join("\n")
       : "- (보유 종목 없음 — 이번이 첫 매입입니다)";
 
     const prompt = [
       body,
       "",
       "────────────────────────────────",
+      activeCategoriesLine(active),
       "[이번 회차 카테고리별 현재 잔액 = budget_krw. 이월 잔액이 포함된 값이다]",
       budgetLines,
       "",
@@ -494,16 +505,10 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
       "",
       "────────────────────────────────",
       "[출력 규칙]",
-      "- 세 카테고리(배당성장·자산성장·고배당) 각각 정확히 한 번씩, 총 3개를 picks에 담아라.",
-      "- 매수면 action=\"buy\", 건너뜀이면 action=\"skip\", 보유 종목을 팔고 다른 종목으로 교체하는 게 낫다고 판단되면 action=\"switch\".",
-      "- action=skip이면 ticker·etf_name·ref_price는 null, ref_qty는 0으로 둔다. 값을 지어내지 마라.",
-      "- action=switch이면 sell_ticker=팔 보유 종목 코드, sell_qty=팔 수량(위 보유 현황의 수량 이내), sell_ref_price=그 종목의 조사 가격. ticker·etf_name·ref_price에는 새로 살 종목을 적는다. 갈아타기의 근거(왜 파는지, 왜 그 종목으로 가는지)를 rationale에 조사 수치를 인용해 설명하라.",
-      "- action이 buy나 skip이면 sell_ticker·sell_qty·sell_ref_price는 null로 둔다.",
-      "- 보유하지 않은 종목을 팔라고 하지 마라. 갈아타기는 위 [현재 보유 현황]에 있는 종목만 대상으로 한다.",
-      "- ref_price는 위 매입 시점 조사 문서의 price를 그대로 쓴다.",
-      "- ref_qty: buy면 floor(budget_krw ÷ ref_price), switch면 floor((budget_krw + sell_qty×sell_ref_price) ÷ ref_price).",
-      "- source_doc_ids에는 위에 표시된 research_doc_id 중 실제로 근거로 쓴 것만 넣어라.",
-      "- JSON 밖에는 아무것도 출력하지 마라.",
+      ...recommendOutputRules(
+        active,
+        holdings.some((h) => !active.includes(h.category)),
+      ),
     ].join("\n");
 
     const res = await runCodex({
@@ -542,14 +547,11 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
 
     const month = monthKeyKST();
     const { rows: normalized, dropped } = normalizePicks(picks, {
-      balances,
+      balances: activeBalances(balances, active),
       injectedDocIds: [research.docId!, ...priorDocs.map((d) => d.id)],
       // 갈아타기 제안의 매도 종목·수량을 실제 보유와 대조하기 위해 넘긴다
-      holdings: holdings.map((h) => ({
-        category: h.category,
-        ticker: h.ticker,
-        qty: h.qty,
-      })),
+      holdings: activeHoldings(holdings, active),
+      active,
     });
 
     // 조사 문서의 가격은 이미 묵은 값이다. 증권사 앱과 같은 값으로 사려면

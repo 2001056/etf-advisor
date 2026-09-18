@@ -1,4 +1,4 @@
-import { desc } from "drizzle-orm";
+import { desc, notInArray } from "drizzle-orm";
 import { db } from "@/db";
 import { researchDocs } from "@/db/schema";
 import { parseResearchDoc } from "./docFormat";
@@ -30,6 +30,8 @@ export async function tickerCandidates(): Promise<TickerCandidate[]> {
     db
       .select({ content: researchDocs.content })
       .from(researchDocs)
+      // ④⑤ 문서는 데이터 표가 없고 매일 쌓여 최근 8건을 다 차지한다
+      .where(notInArray(researchDocs.type, ["watch", "consolidate"]))
       .orderBy(desc(researchDocs.docDate), desc(researchDocs.id))
       .limit(8),
   ]);

@@ -28,7 +28,8 @@
     "check:consolidate": "tsx scripts/check-consolidate.ts",
     "check:accept": "tsx scripts/check-accept.ts",
     "check:switch": "tsx scripts/check-switch.ts",
-    "check:purchase-guard": "tsx scripts/check-purchase-guard.ts"
+    "check:purchase-guard": "tsx scripts/check-purchase-guard.ts",
+    "check:quotes": "tsx scripts/check-quotes.ts"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.1.0",

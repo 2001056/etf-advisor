@@ -1,4 +1,5 @@
-import { Category } from "./money";
+import { CATEGORIES, CATEGORY_LABEL, Category } from "./money";
+import { ParsedDoc, tickersOf } from "./docFormat";
 
 /**
  * ③ 추천 에이전트의 JSON 출력을 DB 행으로 바꾸는 순수 로직.
@@ -10,6 +11,114 @@ export const CATEGORY_FROM_KO: Record<string, Category> = {
   자산성장: "asset_growth",
   고배당: "high_div",
 };
+
+/** 활성 = 설정 화면의 월 충전액 > 0. 잔액은 보지 않는다 — 갈아타기 차액·분배금 같은 잔돈이 비활성 카테고리를 되살리면 안 된다 */
+export function activeCategories(topup: Record<Category, number>): Category[] {
+  const active = CATEGORIES.filter((c) => (topup[c] ?? 0) > 0);
+  return active.length ? active : [...CATEGORIES];
+}
+
+export function activeCategoriesLine(active: Category[]): string {
+  return `[이번 회차 활성 카테고리: ${active.map((c) => CATEGORY_LABEL[c]).join("·")}]`;
+}
+
+export function researchTickers(
+  docs: ParsedDoc[],
+  held: { category: Category; ticker: string }[],
+  active: Category[],
+): string[] {
+  const all = CATEGORIES.every((c) => active.includes(c));
+  const fromDocs = docs.flatMap((d) =>
+    all
+      ? tickersOf(d)
+      : d.dataRows
+          .filter((r) => active.includes(CATEGORY_FROM_KO[r.category.trim()]))
+          .map((r) => r.ticker),
+  );
+  const fromHeld = held
+    .filter((h) => all || active.includes(h.category))
+    .map((h) => h.ticker);
+  return [...new Set([...fromDocs, ...fromHeld])].filter(Boolean);
+}
+
+export const INACTIVE_HOLDING_MARK = "(이번 회차 매수 대상 아님)";
+export const INACTIVE_BUDGET_MARK = "(이번 회차 매수 안 함)";
+
+export function budgetLine(
+  category: Category,
+  balance: number,
+  active: Category[],
+): string {
+  return (
+    `- ${CATEGORY_LABEL[category]}: ${balance.toLocaleString("ko-KR")}원` +
+    (active.includes(category) ? "" : ` ${INACTIVE_BUDGET_MARK}`)
+  );
+}
+
+export function holdingLine(
+  h: {
+    category: Category;
+    ticker: string;
+    etfName: string;
+    qty: number;
+    avgPrice: number;
+  },
+  active: Category[],
+): string {
+  return (
+    `- ${CATEGORY_LABEL[h.category]} | ${h.ticker} ${h.etfName} | ${h.qty}주 | 평단가 ${h.avgPrice.toLocaleString("ko-KR")}원` +
+    (active.includes(h.category) ? "" : ` ${INACTIVE_HOLDING_MARK}`)
+  );
+}
+
+/** 정규화에 넘길 보유 — 비활성 카테고리 보유는 갈아타기 매도 대상이 될 수 없다 */
+export function activeHoldings(
+  holdings: { category: Category; ticker: string; qty: number }[],
+  active: Category[],
+): { category: Category; ticker: string; qty: number }[] {
+  return holdings
+    .filter((h) => active.includes(h.category))
+    .map((h) => ({ category: h.category, ticker: h.ticker, qty: h.qty }));
+}
+
+/** 정규화에 넘길 잔액 — 비활성 카테고리에 잔돈이 있어도 0으로 둬 매수·갈아타기가 성립하지 않게 한다 */
+export function activeBalances(
+  balances: Record<Category, number>,
+  active: Category[],
+): Record<Category, number> {
+  return Object.fromEntries(
+    CATEGORIES.map((c) => [c, active.includes(c) ? balances[c] : 0]),
+  ) as Record<Category, number>;
+}
+
+export function recommendOutputRules(
+  active: Category[],
+  inactiveHeld: boolean,
+): string[] {
+  const labels = active.map((c) => CATEGORY_LABEL[c]).join("·");
+  const countRule =
+    active.length === CATEGORIES.length
+      ? "- 세 카테고리(배당성장·자산성장·고배당) 각각 정확히 한 번씩, 총 3개를 picks에 담아라."
+      : active.length === 1
+        ? `- 이번 회차 활성 카테고리는 ${labels}뿐이다. ${labels} 한 개만 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.`
+        : `- 이번 회차 활성 카테고리는 ${labels}뿐이다. ${labels} 각각 정확히 한 번씩, 총 ${active.length}개를 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.`;
+
+  return [
+    countRule,
+    "- 매수면 action=\"buy\", 건너뜀이면 action=\"skip\", 보유 종목을 팔고 다른 종목으로 교체하는 게 낫다고 판단되면 action=\"switch\".",
+    "- action=skip이면 ticker·etf_name·ref_price는 null, ref_qty는 0으로 둔다. 값을 지어내지 마라.",
+    "- action=switch이면 sell_ticker=팔 보유 종목 코드, sell_qty=팔 수량(위 보유 현황의 수량 이내), sell_ref_price=그 종목의 조사 가격. ticker·etf_name·ref_price에는 새로 살 종목을 적는다. 갈아타기의 근거(왜 파는지, 왜 그 종목으로 가는지)를 rationale에 조사 수치를 인용해 설명하라.",
+    "- action이 buy나 skip이면 sell_ticker·sell_qty·sell_ref_price는 null로 둔다.",
+    "- 보유하지 않은 종목을 팔라고 하지 마라. 갈아타기는 위 [현재 보유 현황]에 있는 종목만 대상으로 한다." +
+      (inactiveHeld
+        ? ` ${INACTIVE_HOLDING_MARK} 표시가 붙은 종목은 팔거나 갈아타지 않는다.`
+        : ""),
+    "- ref_price는 위 매입 시점 조사 문서의 price를 그대로 쓴다.",
+    "- ref_qty: buy면 floor(budget_krw ÷ ref_price), switch면 floor((budget_krw + sell_qty×sell_ref_price) ÷ ref_price).",
+    "- source_doc_ids에는 위에 표시된 research_doc_id 중 실제로 근거로 쓴 것만 넣어라.",
+    "- JSON 밖에는 아무것도 출력하지 마라.",
+  ];
+}
 
 /**
  * 모델 출력에서 JSON을 꺼낸다.
@@ -138,6 +247,8 @@ export function normalizePicks(
     injectedDocIds: number[];
     /** 갈아타기 검증용 현재 보유. (category, ticker) 단위 수량 */
     holdings?: { category: Category; ticker: string; qty: number }[];
+    /** 주면 그 밖의 카테고리 pick은 건너뜀 — 고배당 건너뜀 재배분으로 비활성 카테고리에 돈이 흘러가지 않게 */
+    active?: Category[];
   },
 ): NormalizeResult {
   const list = Array.isArray(raw)
@@ -179,11 +290,19 @@ export function normalizePicks(
     const price = positiveInt(p.ref_price);
     const ticker = String(p.ticker ?? "").replace(/[^0-9A-Za-z]/g, "");
     const explicitSkip = String(p.action ?? "").trim() === "skip";
-    const skipped = explicitSkip || !ticker || price === null;
+    const inactive = ctx.active ? !ctx.active.includes(category) : false;
+    const skipped = explicitSkip || inactive || !ticker || price === null;
 
     // 갈아타기(action="switch"): 팔 종목이 실제 보유와 맞아야만 인정한다.
     // 모델 출력은 보장이 아니므로 여기서 보유 대조 후, 안 맞으면 매수로 강등한다.
     const wantSwitch = String(p.action ?? "").trim() === "switch";
+    if (inactive && !explicitSkip) {
+      dropped.push(
+        wantSwitch
+          ? `이번 회차 매수 대상이 아닌 카테고리라 갈아타기를 적용하지 않음 — ${CATEGORY_LABEL[category]} ${String(p.sell_ticker ?? "?")} → ${ticker || "?"}`
+          : `이번 회차 매수 대상이 아닌 카테고리라 매수하지 않음 — ${CATEGORY_LABEL[category]} ${ticker || "?"}`,
+      );
+    }
     let sellTicker: string | null = null;
     let sellQty: number | null = null;
     let sellRefPrice: number | null = null;

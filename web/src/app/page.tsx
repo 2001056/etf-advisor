@@ -695,7 +695,18 @@ export default async function DashboardPage() {
                     </td>
                     <td className="text-right tabular-nums">
                       {h.dividend != null ? (
-                        h.dividend.toLocaleString("ko-KR")
+                        <>
+                          {h.dividend.toLocaleString("ko-KR")}
+                          {h.quote?.distYieldStale && h.quote.distYieldAsOf && (
+                            <span
+                              className="ml-1 text-xs text-amber-600"
+                              title={`분배율 ${h.quote.distYield}% — ${h.quote.distYieldAsOf} 조사 문서 값`}
+                            >
+                              ({Number(h.quote.distYieldAsOf.slice(5, 7))}/
+                              {Number(h.quote.distYieldAsOf.slice(8, 10))} 기준)
+                            </span>
+                          )}
+                        </>
                       ) : (
                         <span className="text-neutral-400">—</span>
                       )}

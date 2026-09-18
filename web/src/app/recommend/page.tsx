@@ -1,6 +1,11 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { getBalances, isOnboarded, runLazyTopup } from "@/domain/ledger";
+import {
+  getBalances,
+  getMonthlyTopup,
+  isOnboarded,
+  runLazyTopup,
+} from "@/domain/ledger";
 import {
   CATEGORIES,
   CATEGORY_LABEL,
@@ -8,7 +13,11 @@ import {
   dateKeyKST,
   formatKRW,
 } from "@/domain/money";
-import { computeRefQty, isDrift } from "@/domain/recommendation";
+import {
+  activeCategories,
+  computeRefQty,
+  isDrift,
+} from "@/domain/recommendation";
 import { getAllPrompts } from "@/domain/prompts";
 import { acceptedRecommendationIds } from "@/domain/purchases";
 import {
@@ -62,11 +71,12 @@ export default async function RecommendPage() {
   if (!(await isOnboarded())) redirect("/onboarding");
   await runLazyTopup();
 
+  const active = activeCategories(await getMonthlyTopup());
   const [balances, running, latest, tickers, prompts] = await Promise.all([
     getBalances(),
     getRunningRun(),
     latestRecommendation(),
-    tickersToResearch(),
+    tickersToResearch(active),
     getAllPrompts(),
   ]);
 
@@ -127,7 +137,19 @@ export default async function RecommendPage() {
 
       <Card title="추천 실행">
         <Runner busyAtLoad={Boolean(running)} />
-        <p className="mt-4 text-xs text-neutral-500">
+        <p className="mt-4 text-sm">
+          이번 회차 활성 카테고리:{" "}
+          <b>{active.map((c) => CATEGORY_LABEL[c]).join("·")}</b>
+          <span className="ml-1 text-xs text-neutral-500">
+            (
+            <Link href="/settings" className="underline">
+              설정
+            </Link>
+            의 월 충전액이 0보다 큰 카테고리. 모두 0이면 세 카테고리 전부.
+            나머지 카테고리 보유 종목은 매수·갈아타기 없이 ④ 보유 점검만 계속합니다)
+          </span>
+        </p>
+        <p className="mt-2 text-xs text-neutral-500">
           이번에 재조사할 종목 {tickers.length}개
           {tickers.length > 0 && `: ${tickers.join(", ")}`}
           {tickers.length === 0 &&
