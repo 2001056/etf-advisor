@@ -103,7 +103,12 @@ const buy = normalizePicks(
   },
   ctx,
 );
-check("3건 정규화", buy.rows.length, 3);
+// 자산성장 pick 이 하나라 안정적 성장 자리가 비고, 그 빈 자리가 건너뜀 행으로 뒤에 붙는다
+check("3건 + 빈 자리 1건", buy.rows.length, 4);
+const buyEmptySeat = buy.rows.at(3);
+check("빈 자리 행은 맨 뒤", [buyEmptySeat?.category, buyEmptySeat?.role, buyEmptySeat?.skipped], ["asset_growth", "stable", true]);
+check("  그 자리 몫만 들고 있다 floor(210000×0.5)", buyEmptySeat?.budgetKrw, 105_000);
+check("  사유", buyEmptySeat?.rationale, "모델이 이 자리를 내지 않음");
 check(
   "자산성장 pick 1개라 자리 자동 배정·빈 자리 이월 2건만 기록",
   buy.dropped,
@@ -255,7 +260,10 @@ const redistributed = normalizePicks(
   },
   ctx,
 );
-const byCat = Object.fromEntries(redistributed.rows.map((r) => [r.category, r]));
+// 빈 자리 건너뜀 행이 뒤에 붙으므로 카테고리마다 먼저 나온(모델이 낸) 행을 본다
+const byCat = Object.fromEntries(
+  [...redistributed.rows].reverse().map((r) => [r.category, r]),
+);
 // 배당성장 437,500 ÷ 14,000 = 31.25 → 31주 (재배분 전이면 25주)
 check("배당성장 배정액", byCat.div_growth.budgetKrw, 437_500);
 check("배당성장 수량(재배분 반영)", byCat.div_growth.refQty, 31);
@@ -270,6 +278,24 @@ check(
 // 건너뛴 고배당은 자기 잔액을 이월액으로 표시
 check("고배당 이월액", byCat.high_div.budgetKrw, 140_000);
 check("고배당 skipped", byCat.high_div.skipped, true);
+// 빈 안정적 성장 자리도 재배분된 자산성장 배정액에서 자기 몫을 들고 이월된다
+check(
+  "빈 자리 행도 재배분 후 자리 몫",
+  redistributed.rows.at(-1),
+  {
+    category: "asset_growth", role: "stable", weight: 0.5,
+    ticker: null, etfName: null, budgetKrw: 131_250, refPrice: null, refQty: 0,
+    sellTicker: null, sellQty: null, sellRefPrice: null,
+    researchPrice: null, sellResearchPrice: null,
+    priceSource: "research", pricedAt: null, skipped: true,
+    rationale: "모델이 이 자리를 내지 않음", sourceDocIds: [], sourceUrls: [],
+  },
+);
+check(
+  "  두 자리 몫의 합은 자산성장 배정액을 넘지 않는다",
+  131_250 + 131_250 <= 262_500,
+  true,
+);
 
 console.log("\n=== 모델이 낸 수량이 틀려도 시스템이 다시 계산한다 ===");
 const wrongQty = normalizePicks(
@@ -383,9 +409,10 @@ check("② 표 가격이 research_price", fromDoc[0].researchPrice, 12_000);
 check("  기준가는 모델이 적어 온 실시간가 그대로", fromDoc[0].refPrice, 12_380);
 check("② 표에 없는 티커는 null", fromDoc[1].researchPrice, null);
 check(
+  // 3번째는 빈 안정적 성장 자리 행이다 — 종목이 없으니 원값도 없다
   "대조군: ② 표를 안 넘기면 전부 null (실시간가를 베껴 넣지 않는다)",
   normalizePicks({ picks: v3Picks }, ctx).rows.map((r) => r.researchPrice),
-  [null, null],
+  [null, null, null],
 );
 check(
   "건너뛴 행은 ② 표에 있어도 null",
@@ -471,10 +498,11 @@ check(
 );
 
 console.log("\n=== 실시간가는 필수다: 하나도 못 받으면 전부 건너뜀 ===");
+// base 4행 = 배당성장 매수 / 자산성장 매수 / 고배당 skip / 빈 안정적 성장 자리
 const blackout = applyRealtimePrices(base, new Map());
-check("매수 행이 전부 건너뜀", blackout.rows.map((r) => r.skipped), [true, true, true]);
-check("기준가도 전부 비었다", blackout.rows.map((r) => r.refPrice), [null, null, null]);
-check("수량도 전부 0", blackout.rows.map((r) => r.refQty), [0, 0, 0]);
+check("매수 행이 전부 건너뜀", blackout.rows.map((r) => r.skipped), [true, true, true, true]);
+check("기준가도 전부 비었다", blackout.rows.map((r) => r.refPrice), [null, null, null, null]);
+check("수량도 전부 0", blackout.rows.map((r) => r.refQty), [0, 0, 0, 0]);
 check("적용 0/2", [blackout.applied, blackout.eligible], [0, 2]);
 check(
   "제외 사유 2건",
@@ -490,7 +518,7 @@ check(
       ["133690", { price: 20_000, pricedAt }],
     ]),
   ).rows.map((r) => [r.skipped, r.priceSource]),
-  [[false, "realtime"], [false, "realtime"], [true, "research"]],
+  [[false, "realtime"], [false, "realtime"], [true, "research"], [true, "research"]],
 );
 
 console.log("\n=== 빼낸 행의 이월액은 정규화의 불변식과 같다 (비자리=재배분 전 잔액, 자리=자리 몫) ===");
@@ -1129,10 +1157,20 @@ const assetPick = normalizePicks(
   },
   { balances: assetBalances, injectedDocIds: [], active: ["asset_growth"] },
 );
-check("1행", assetPick.rows.length, 1);
+check("1행 + 빈 자리 1행", assetPick.rows.length, 2);
 check("자산성장", assetPick.rows[0].category, "asset_growth");
 check("자리 몫만 배정 floor(500000×0.5)", assetPick.rows[0].budgetKrw, 250_000);
 check("수량 floor(250000/22000)", assetPick.rows[0].refQty, 11);
+check(
+  "빈 안정적 성장 자리가 건너뜀 행으로 남는다",
+  [assetPick.rows.at(1)?.role, assetPick.rows.at(1)?.skipped, assetPick.rows.at(1)?.budgetKrw, assetPick.rows.at(1)?.refQty],
+  ["stable", true, 250_000, 0],
+);
+check(
+  "  두 행의 배정 합계가 잔액을 넘지 않는다",
+  assetPick.rows.reduce((a, r) => a + r.budgetKrw, 0) <= 500_000,
+  true,
+);
 check(
   "사유 2건(자리 자동 배정 + 빈 자리 이월)",
   assetPick.dropped,
@@ -1147,6 +1185,11 @@ console.log("\n=== 형식 지시문: 세 개 활성이면 HEAD 원문 스냅샷�
 // 활성 카테고리를 지정해도 소제목·예시 행 말고는 바뀌지 않는다는 것을 보는 대조군 스냅샷.
 // 기준은 커밋 9b2b83d + 이번 회차에 고친 total_return_1y·nav_trend 정의 2줄이며,
 // 여기 문자열은 고정이다(빌드 시점 HEAD 를 읽어 오면 HEAD 가 바뀔 때마다 검사가 깨진다).
+//
+// 2026-09-21 갱신 사유: ①②가 데이터 표 note 에 자리를 적으려면 자리 이름의 뜻이 문서에
+// 있어야 한다(전에는 ③ 출력 규칙에만 있었다). 그래서 자산성장이 보이는 문서에는 ## 3 안내
+// 뒤에 [자리 정의] 4줄이 붙는다 — 세 카테고리가 모두 활성이어도 자산성장이 있으니 붙는다.
+// 자산성장이 없는 문서(고배당만 등)에는 붙지 않는다(아래 대조군).
 const HEAD_FORMAT_ONDEMAND = `
 ────────────────────────────────
 [출력 형식 — 반드시 지킬 것]
@@ -1174,6 +1217,11 @@ model: (사용한 모델명)
 ### 자산성장
 ### 고배당
 (각 항목에 ETF별 현재가·최근 분배금·분배율·괴리율·특이사항)
+
+[자리 정의] 공격적 성장: 변동이 크더라도 장기 기대 수익이 높은 성장 지수 / 안정적 성장: 여러 업종에 분산하여 특정 업종·종목 의존도를 낮추는 주식 지수
+- 자산성장으로 분류한 행은 ## 4 데이터 표의 note 첫머리에 자리(공격 / 안정 / 미정)와 환헤지 여부(H / 비H)를 적는다.
+- 상품 전략을 충분히 확인하지 못해 자리를 정할 수 없으면 "미정"으로 두고 그 사유를 note에 적는다. 억지로 한쪽에 넣지 마라.
+- 자산성장이 아닌 카테고리로 분류한 행에는 자리를 적지 않는다.
 
 ## 4. 데이터 표
 | ticker | name | category | price | dist_yield | total_return_1y | nav_trend | yield_basis | premium | note |
@@ -1239,6 +1287,36 @@ check(
       "| 360750 | TIGER 미국S&P500 | 자산성장 | 12345 | 1.1 | 18.3 | up | trailing12m | 0.1 | 비고 |",
       "| 446720 | SOL 미국배당다우존스 | 배당성장 | 12345 | 3.5 | 14.2 | up | trailing12m | 0.1 | 비고 |",
     ) === HEAD_FORMAT_ONDEMAND,
+  true,
+);
+
+console.log("\n=== [자리 정의]는 자산성장이 보이는 문서에만 붙는다 ===");
+const seatDefLine = "[자리 정의] 공격적 성장: 변동이 크더라도 장기 기대 수익이 높은 성장 지수 / 안정적 성장: 여러 업종에 분산하여 특정 업종·종목 의존도를 낮추는 주식 지수";
+check("세 개 활성", buildFormatInstruction({ ...fmtBase, categories: ALL }).includes(seatDefLine), true);
+check("자산성장만", fmtAsset.includes(seatDefLine), true);
+check("지정 없음(④ 경로)", buildFormatInstruction(fmtBase).includes(seatDefLine), true);
+check("note 규칙도 함께", fmtAsset.includes('자리를 정할 수 없으면 "미정"으로 두고'), true);
+check("자산성장 밖 행에는 적지 않는다", fmtAsset.includes("자산성장이 아닌 카테고리로 분류한 행에는 자리를 적지 않는다"), true);
+check(
+  "대조군: 고배당만이면 붙지 않는다",
+  buildFormatInstruction({ ...fmtBase, categories: ["high_div"] }).includes("[자리 정의]"),
+  false,
+);
+check(
+  "대조군: 배당성장+고배당이어도 붙지 않는다",
+  buildFormatInstruction({ ...fmtBase, categories: ["div_growth", "high_div"] }).includes("[자리 정의]"),
+  false,
+);
+// 예시 행은 첫 활성 카테고리를 따라 바뀌므로 양쪽 모두에서 지우고 비교한다
+const stripExample = (s: string) => s.replace(/^\| \d{6} .*$/m, "(예시 행)");
+check(
+  "대조군: 자리 정의 4줄 말고는 고배당만 문서와 같다",
+  stripExample(
+    buildFormatInstruction({ ...fmtBase, categories: ["asset_growth", "high_div"] }),
+  )
+    .replace(/\n\[자리 정의\][\s\S]*?자리를 적지 않는다\.\n/, "")
+    .replace("### 자산성장\n### 고배당", "### 고배당") ===
+    stripExample(buildFormatInstruction({ ...fmtBase, categories: ["high_div"] })),
   true,
 );
 
@@ -1342,8 +1420,13 @@ const sameTicker = normalizePicks(
   },
   seatCtx,
 );
-check("1행", sameTicker.rows.length, 1);
+check("1행 + 빈 자리 1행", sameTicker.rows.length, 2);
 check("공격적 성장 자리만 앉는다", sameTicker.rows[0].role, "aggressive");
+check(
+  "비운 안정적 성장 자리는 사유가 적힌 건너뜀 행으로 남는다",
+  [sameTicker.rows.at(1)?.role, sameTicker.rows.at(1)?.skipped, sameTicker.rows.at(1)?.budgetKrw, sameTicker.rows.at(1)?.rationale],
+  ["stable", true, 250_000, "두 자리에 같은 종목 — 안정적 성장 자리 비움"],
+);
 check("자리 몫만 배정", sameTicker.rows[0].budgetKrw, 250_000);
 check("비중도 자리 비중", sameTicker.rows[0].weight, 0.5);
 check("수량 floor(250000/22000)", sameTicker.rows[0].refQty, 11);
@@ -1368,7 +1451,7 @@ const sameTickerStableFirst = normalizePicks(
   },
   { ...seatCtx, roleWeights: { aggressive: 0.7, stable: 0.3 } },
 );
-check("대조군(stable 먼저): 1행", sameTickerStableFirst.rows.length, 1);
+check("대조군(stable 먼저): 1행 + 빈 자리 1행", sameTickerStableFirst.rows.length, 2);
 check(
   "  남는 자리는 여전히 공격적 성장",
   sameTickerStableFirst.rows[0].role,
@@ -1450,8 +1533,13 @@ const dupRole = normalizePicks(
   },
   seatCtx,
 );
-check("1행", dupRole.rows.length, 1);
+check("1행 + 빈 자리 1행", dupRole.rows.length, 2);
 check("먼저 나온 종목", dupRole.rows[0].ticker, "133690");
+check(
+  "  모델이 내지 않은 안정적 성장 자리는 건너뜀 행",
+  [dupRole.rows.at(1)?.role, dupRole.rows.at(1)?.skipped, dupRole.rows.at(1)?.rationale],
+  ["stable", true, "모델이 이 자리를 내지 않음"],
+);
 check("자리가 하나 비어도 앉은 자리 몫만", dupRole.rows[0].budgetKrw, 250_000);
 check(
   "사유 기록",
@@ -1496,7 +1584,7 @@ const seatOmitted = normalizePicks(
   { picks: [pick({ role: "aggressive", ticker: "133690", ref_price: 21_000 })] },
   seatCtx,
 );
-check("1행", seatOmitted.rows.length, 1);
+check("1행 + 빈 자리 1행", seatOmitted.rows.length, 2);
 check("공격 자리 몫만 배정", seatOmitted.rows[0].budgetKrw, 250_000);
 check("비중 기록", seatOmitted.rows[0].weight, 0.5);
 check("수량 floor(250000/21000)", seatOmitted.rows[0].refQty, 11);
@@ -1584,8 +1672,28 @@ check(
   true,
 );
 
+console.log("\n=== 대조군: 두 자리가 다 차면 빈 자리 행이 생기지 않는다 ===");
+check("2행 그대로", twoSeats.rows.length, 2);
+check("건너뜀 행 없음", twoSeats.rows.filter((r) => r.skipped).length, 0);
+check(
+  "대조군: 자리를 두지 않는 카테고리만 비어도 빈 자리 행은 없다",
+  normalizePicks(
+    { picks: [{ category: "배당성장", action: "buy", ticker: "446720", etf_name: "A", ref_price: 14_000, ref_qty: 1, rationale: "", source_doc_ids: [], source_urls: [] }] },
+    { balances, injectedDocIds: [], active: ["div_growth"] as Category[] },
+  ).rows.length,
+  1,
+);
+check(
+  "대조군: 자산성장이 비활성이면 빈 자리 행을 만들지 않는다",
+  normalizePicks(
+    { picks: [pick({ role: "aggressive", ticker: "133690", ref_price: 21_000 })] },
+    { balances: seatBalances, injectedDocIds: [], active: ["high_div"] as Category[] },
+  ).rows.map((r) => [r.role, r.skipped]),
+  [["aggressive", true]],
+);
+
 console.log("\n=== 대조군: 자리를 두지 않는 카테고리는 자리 도입 전과 같다 ===");
-check("3행 그대로", buy.rows.length, 3);
+check("3행 + 빈 자리 1행", buy.rows.length, 4);
 check("배당성장·고배당은 자리·비중 없음", [buy.rows[0].role, buy.rows[0].weight, buy.rows[2].role, buy.rows[2].weight], [null, null, null, null]);
 check("  배정액 = 각 카테고리 잔액", [buy.rows[0].budgetKrw, buy.rows[2].budgetKrw], [350_000, 140_000]);
 check("  수량도 그대로", [buy.rows[0].refQty, buy.rows[2].refQty], [24, 15]);

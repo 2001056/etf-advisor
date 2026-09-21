@@ -70,6 +70,12 @@ const ALERT_SCHEMA = {
 const SEVERITY = new Set(["info", "warn", "danger"]);
 const ACTION = new Set(["hold", "stop_buying", "sell"]);
 
+/**
+ * 적립 중단 카테고리 보유의 조치를 시스템이 hold로 내렸을 때 issue 앞에 붙이는 표시.
+ * 화면에는 "보유 유지"만 보이므로, 그게 모델의 판단이 아니라 시스템 고정임을 알려야 한다.
+ */
+export const FORCED_HOLD_PREFIX = "[적립 중단 카테고리 — 매도 여부는 직접 판단] ";
+
 export type WatchOutcome = {
   runId: number;
   docId: number | null;
@@ -111,7 +117,8 @@ ${lines}
 - action=sell이면 replacement_ticker/replacement_name에 **같은 카테고리**의 대체 종목을 넣어라.
   ${CATEGORY_LABEL[ROLE_CATEGORY]} 보유의 대체 종목은 **같은 자리**에서 고른다.
   대체 후보를 못 찾으면 둘 다 null로 두고 rationale에 이유를 적어라.
-- **(적립 중단 카테고리)로 표시된 보유는 위험 판정은 똑같이 하되 대체 종목을 제시하지 마라.**
+- **(적립 중단 카테고리)로 표시된 보유는 위험 판정(severity)은 동일하게 하되 action은 hold로 두고,
+  매도가 필요해 보이면 그 이유를 issue에 적는다(대체 종목 없음).**
   replacement는 둘 다 null로 두고, 매도·이동 여부는 사람이 결정한다.
 - sell이 아니면 replacement는 둘 다 null이다.
 - issue는 무엇이 문제인지 한 줄. 문제가 없으면 "이상 없음"이라고 쓴다.
@@ -169,14 +176,21 @@ export function normalizeAlerts(
     if (isSell && rt && inactive) {
       dropped.push(`적립 중단 카테고리라 대체 종목 제외: ${ticker}`);
     }
+    // 재원도 대체 종목도 없는 카테고리에 매도·매수중단을 권하면 사람이 따를 길이 없다.
+    // 위험 판정(severity)은 그대로 두고 조치만 hold로 내린다 — 팔지 말지는 사람이 정한다.
+    const forcedHold = inactive && action !== "hold";
+    if (forcedHold) {
+      dropped.push(`적립 중단 카테고리라 action=${action} → hold 고정: ${ticker}`);
+    }
+    const issue = String(a.issue ?? "").slice(0, 500) || "이상 없음";
 
     rows.push({
       ticker,
       etfName: held.etfName,
       category: held.category,
       severity: severity as "info" | "warn" | "danger",
-      action: action as "hold" | "stop_buying" | "sell",
-      issue: String(a.issue ?? "").slice(0, 500) || "이상 없음",
+      action: (forcedHold ? "hold" : action) as "hold" | "stop_buying" | "sell",
+      issue: forcedHold ? `${FORCED_HOLD_PREFIX}${issue}` : issue,
       replacementTicker: keepReplacement ? rt : null,
       replacementName: keepReplacement
         ? String(a.replacement_name ?? "") || null

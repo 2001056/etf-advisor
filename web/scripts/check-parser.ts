@@ -159,6 +159,25 @@ check("음수 총수익률", w.dataRows[2].totalReturn1y, -4.5);
 check("분배율 높은데 NAV down", w.dataRows[2].navTrend, "down");
 check("새 열 있어도 형식 경고 없음", w.problems.length, 0);
 
+console.log("\n--- 같은 지수의 비대표 행도 그대로 받는다 (표 행 수 제한 없음) ---");
+// ①이 대표 1개만 후보로 두되 비대표 상품도 표에 남기므로, 같은 지수 행이 여럿 온다.
+// 파서가 행 수를 제한하거나 note 내용을 보고 거르면 그 상품은 ②·③에서 사라진다.
+const NON_REP = GOOD.replace(
+  "| 486290 | 미확인 ETF | 고배당 |  |  |  | 가격 확인 실패 |",
+  [
+    "| 486290 | 미확인 ETF | 고배당 |  |  |  | 가격 확인 실패 |",
+    "| 111110 | 대표 성장 ETF | 자산성장 | 20000 | 0.8 | 0.05 | 공격 / 비H, 대표 |",
+    "| 222220 | 같은지수 성장 ETF | 자산성장 | 21000 | 0.7 | 0.06 | 공격 / 비H, 동일 지수 비대표(대표: 111110) |",
+    "| 333330 | 자리 미정 ETF | 자산성장 | 19000 | 0.9 | 0.04 | 미정 / H, 운용전략 확인 불가 |",
+  ].join("\n"),
+);
+const rep = parseResearchDoc(NON_REP);
+check("행이 모두 살아남는다", rep.dataRows.length, 6);
+check("형식 경고 없음", rep.problems, []);
+check("비대표 note 보존", rep.dataRows[4].note, "공격 / 비H, 동일 지수 비대표(대표: 111110)");
+check("자리 미정 note 보존", rep.dataRows[5].note, "미정 / H, 운용전략 확인 불가");
+check("종목 유니온에 비대표 포함", tickersOf(rep).includes("222220"), true);
+
 console.log("\n--- 예전 문서(새 열 없음)는 여전히 정상 ---");
 const old = parseResearchDoc(GOOD);
 check("형식 경고 없음", old.problems.length, 0);

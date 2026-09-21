@@ -465,6 +465,9 @@ export function normalizePicks(
   const seatOf = new Map<Draft, GrowthRole>();
   /** 자리에 앉은 pick의 비중. 두 자리를 한 종목으로 합쳤을 때만 비어 있다 */
   const splitOf = new Map<Draft, number>();
+  /** 자산성장이 활성일 때 채워지지 않은 자리 — 3차에서 건너뜀 행으로 만든다 */
+  const emptySeats: { role: GrowthRole; reason: string }[] = [];
+  const roleActive = ctx.active ? ctx.active.includes(ROLE_CATEGORY) : true;
 
   for (const category of CATEGORIES) {
     const mine = drafts.filter((d) => d.category === category);
@@ -511,6 +514,9 @@ export function normalizePicks(
       seats.set(free, d);
     }
 
+    /** 자리가 빈 사유. 적어 두지 않은 자리는 "모델이 내지 않았다"가 사유다 */
+    const emptyReason = new Map<GrowthRole, string>();
+
     // 두 자리에 같은 종목이면 나눠 담은 게 아니다. filled는 GROWTH_ROLES 순서라
     // 모델이 어느 자리를 먼저 냈든 aggressive가 남고 stable 자리를 비운다.
     // 합쳐서 잔액 전부를 한 종목에 몰아주지 않는다.
@@ -525,6 +531,10 @@ export function normalizePicks(
       ) {
         dead.add(second);
         seats.delete(filled[1]);
+        emptyReason.set(
+          filled[1],
+          `두 자리에 같은 종목 — ${GROWTH_ROLE_LABEL[filled[1]]} 자리 비움`,
+        );
         dropped.push(
           `${CATEGORY_LABEL[category]} 두 자리에 같은 종목 — ${GROWTH_ROLE_LABEL[filled[1]]} 자리 비움 — ${first.ticker}`,
         );
@@ -539,6 +549,15 @@ export function normalizePicks(
       dropped.push(
         `${CATEGORY_LABEL[category]} 자리 ${empty}개가 비어 그 몫은 ${CATEGORY_LABEL[category]} 잔액으로 이월`,
       );
+      // 사유를 로그에만 남기면 화면에는 그 자리가 통째로 사라져 몫이 어디 갔는지 보이지 않는다.
+      if (roleActive) {
+        for (const r of GROWTH_ROLES.filter((x) => !seats.has(x))) {
+          emptySeats.push({
+            role: r,
+            reason: emptyReason.get(r) ?? "모델이 이 자리를 내지 않음",
+          });
+        }
+      }
     }
   }
 
@@ -603,6 +622,32 @@ export function normalizePicks(
       sourceUrls: d.sourceUrls,
     };
   });
+
+  // 빈 자리도 행으로 남긴다 — /recommend 의 기존 건너뜀 렌더가 "이 자리 몫 N원 이월"을 보여준다.
+  // 폼이 없는 건너뜀 행이라 합계·수락 경로에는 영향이 없다.
+  for (const { role, reason } of emptySeats) {
+    rows.push({
+      category: ROLE_CATEGORY,
+      role,
+      weight: roleWeights[role],
+      ticker: null,
+      etfName: null,
+      budgetKrw: seatBudget(budgets[ROLE_CATEGORY], roleWeights[role]),
+      refPrice: null,
+      refQty: 0,
+      sellTicker: null,
+      sellQty: null,
+      sellRefPrice: null,
+      researchPrice: null,
+      sellResearchPrice: null,
+      priceSource: "research",
+      pricedAt: null,
+      skipped: true,
+      rationale: reason,
+      sourceDocIds: [],
+      sourceUrls: [],
+    });
+  }
 
   return { rows, dropped };
 }

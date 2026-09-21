@@ -39,9 +39,9 @@ async function main() {
   check("빈 결과", m5.size === 0);
 
   console.log("\n=== 실시간 전용 조회 (공식 API를 건너뛴다) ===");
-  const r = await getRealtimePrices(["069500", "458730"]);
+  const r = await getRealtimePrices(["069500", "133690"]);
   check("2종목 조회", r.size === 2, `size=${r.size}`);
-  for (const t of ["069500", "458730"]) {
+  for (const t of ["069500", "133690"]) {
     const v = r.get(t);
     console.log(
       `   ${t}  ${v?.price.toLocaleString("ko-KR") ?? "?"}원  ${v?.marketStatus ?? "?"}  기준 ${v?.pricedAt.toISOString() ?? "?"}`,

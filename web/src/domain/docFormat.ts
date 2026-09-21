@@ -1,4 +1,10 @@
 import { CATEGORIES, CATEGORY_LABEL, Category } from "./money";
+import {
+  GROWTH_ROLES,
+  GROWTH_ROLE_HINT,
+  GROWTH_ROLE_LABEL,
+  ROLE_CATEGORY,
+} from "./recommendation";
 
 /**
  * 조사 문서 표준 형식 (기획서 §5.4).
@@ -93,6 +99,16 @@ export function buildFormatInstruction(opts: {
   const subheadings = shown.map((c) => `### ${CATEGORY_LABEL[c]}`).join("\n");
   // 예시 행 카테고리를 모델이 그대로 따라 쓰는 경향이 있다 — 첫 활성 카테고리로 맞춘다
   const exampleRow = EXAMPLE_ROW[shown[0]];
+  // 자리 이름의 뜻은 ③ 출력 규칙에만 있었다 — ①②가 note에 자리를 적으려면 여기에도 있어야
+  // 문서마다 다른 기준으로 자리를 부여하지 않는다. 정의는 recommendation.ts 한 곳에서 온다.
+  const seatBlock = shown.includes(ROLE_CATEGORY)
+    ? `
+[자리 정의] ${GROWTH_ROLES.map((r) => `${GROWTH_ROLE_LABEL[r]}: ${GROWTH_ROLE_HINT[r]}`).join(" / ")}
+- ${CATEGORY_LABEL[ROLE_CATEGORY]}으로 분류한 행은 ## 4 데이터 표의 note 첫머리에 자리(공격 / 안정 / 미정)와 환헤지 여부(H / 비H)를 적는다.
+- 상품 전략을 충분히 확인하지 못해 자리를 정할 수 없으면 "미정"으로 두고 그 사유를 note에 적는다. 억지로 한쪽에 넣지 마라.
+- ${CATEGORY_LABEL[ROLE_CATEGORY]}이 아닌 카테고리로 분류한 행에는 자리를 적지 않는다.
+`
+    : "";
 
   return `
 ────────────────────────────────
@@ -118,7 +134,7 @@ model: (사용한 모델명)
 ## 3. 카테고리별 ETF 현황
 ${subheadings}
 (각 항목에 ETF별 현재가·최근 분배금·분배율·괴리율·특이사항)
-
+${seatBlock}
 ## 4. 데이터 표
 | ticker | name | category | price | dist_yield | total_return_1y | nav_trend | yield_basis | premium | note |
 |---|---|---|---|---|---|---|---|---|---|
