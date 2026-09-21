@@ -4,8 +4,9 @@ import path from "node:path";
 import os from "node:os";
 import { sql } from "drizzle-orm";
 import { db } from "../src/db";
-import { researchDocs, purchases } from "../src/db/schema";
+import { researchDocs } from "../src/db/schema";
 import { deleteResearchDocs, deleteAllResearchDocs } from "../src/domain/research";
+import { guardAgainstRealData } from "./lib/guard";
 
 let failed = 0;
 function check(l: string, ok: boolean, d = "") {
@@ -15,10 +16,7 @@ function check(l: string, ok: boolean, d = "") {
 const exists = async (p: string) => access(p).then(() => true).catch(() => false);
 
 async function main() {
-  const guard = await db.select({ n: sql<number>`(select count(*) from ${purchases})::int` }).from(sql`(select 1) as _`);
-  if (Number(guard[0]?.n ?? 0) > 0 && process.env.ALLOW_WIPE !== "1") {
-    console.error("데이터가 있는 DB입니다. 검증용 DB에서 실행하세요."); process.exit(2);
-  }
+  await guardAgainstRealData();
   await db.execute(sql`truncate ${researchDocs} restart identity cascade`);
 
   const dir = path.join(os.tmpdir(), "etf-doc-del-test");

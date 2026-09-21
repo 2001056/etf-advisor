@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   agentRuns,
@@ -19,7 +19,11 @@ import {
   CATEGORIES,
   Category,
 } from "@/domain/money";
-import { getBalances, getMonthlyTopup } from "@/domain/ledger";
+import {
+  getBalances,
+  getGrowthRoleWeights,
+  getMonthlyTopup,
+} from "@/domain/ledger";
 import { getHoldings } from "@/domain/purchases";
 // JSON 추출·정수 변환·pick 정규화는 순수 로직이라 분리했다.
 // 회귀 테스트: scripts/check-recommend.ts
@@ -27,14 +31,16 @@ import {
   activeBalances,
   activeCategories,
   activeCategoriesLine,
-  activeHoldings,
   applyRealtimePrices,
   budgetLine,
   extractJson,
   holdingLine,
   normalizePicks,
+  realtimePriceBlock,
   recommendOutputRules,
   researchTickers,
+  roleBudgetLine,
+  ROLE_CATEGORY,
 } from "@/domain/recommendation";
 import { getPrompt } from "@/domain/prompts";
 import { checkDocument, issuesToProblems } from "@/domain/dataChecks";
@@ -318,16 +324,14 @@ const RECOMMEND_SCHEMA = {
             type: "string",
             enum: ["배당성장", "자산성장", "고배당"],
           },
-          action: { type: "string", enum: ["buy", "skip", "switch"] },
+          action: { type: "string", enum: ["buy", "skip"] },
+          // 자산성장 pick만: 어느 자리인지. 다른 카테고리는 null
+          role: { type: ["string", "null"], enum: ["aggressive", "stable", null] },
           ticker: { type: ["string", "null"] },
           etf_name: { type: ["string", "null"] },
           budget_krw: { type: "integer" },
           ref_price: { type: ["integer", "null"] },
           ref_qty: { type: "integer" },
-          // action="switch"일 때만: 팔 보유 종목·수량·조사가. buy/skip은 null
-          sell_ticker: { type: ["string", "null"] },
-          sell_qty: { type: ["integer", "null"] },
-          sell_ref_price: { type: ["integer", "null"] },
           rationale: { type: "string" },
           source_doc_ids: { type: "array", items: { type: "integer" } },
           source_urls: { type: "array", items: { type: "string" } },
@@ -335,14 +339,12 @@ const RECOMMEND_SCHEMA = {
         required: [
           "category",
           "action",
+          "role",
           "ticker",
           "etf_name",
           "budget_krw",
           "ref_price",
           "ref_qty",
-          "sell_ticker",
-          "sell_qty",
-          "sell_ref_price",
           "rationale",
           "source_doc_ids",
           "source_urls",
@@ -465,19 +467,32 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
       (d) => d.id !== research.docId,
     );
 
-    const [balances, holdings, { body }] = await Promise.all([
+    const [balances, holdings, { body }, roleWeights] = await Promise.all([
       getBalances(),
       getHoldings(),
       getPrompt("recommend"),
+      getGrowthRoleWeights(),
     ]);
 
-    const budgetLines = CATEGORIES.map((c) =>
+    const budgetLines = CATEGORIES.flatMap((c) => [
       budgetLine(c, balances[c], active),
-    ).join("\n");
+      ...(c === ROLE_CATEGORY && active.includes(c)
+        ? [roleBudgetLine(balances[c], roleWeights)]
+        : []),
+    ]).join("\n");
 
     const holdingLines = holdings.length
       ? holdings.map((h) => holdingLine(h, active)).join("\n")
       : "- (보유 종목 없음 — 이번이 첫 매입입니다)";
+
+    // ② 문서의 price는 조사 시점 값이다. 모델이 1주 매수 가능 여부와 ref_qty를
+    // 증권사 앱과 같은 값으로 판단하도록 조립 전에 실시간 시세를 먼저 받아 앞에 붙인다.
+    const freshParsed = parseResearchDoc(freshDoc.content);
+    const liveTickers = researchTickers([freshParsed], holdings, active);
+    const liveBlock = realtimePriceBlock(
+      liveTickers,
+      liveTickers.length ? await getRealtimePrices(liveTickers) : new Map(),
+    );
 
     const prompt = [
       body,
@@ -489,6 +504,8 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
       "",
       "[현재 보유 현황]",
       holdingLines,
+      "",
+      liveBlock,
       "",
       `[매입 시점 조사 결과 — research_doc_id: ${freshDoc.id}, 가장 최신. 이것을 기준선으로 삼을 것]`,
       freshDoc.content,
@@ -505,10 +522,7 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
       "",
       "────────────────────────────────",
       "[출력 규칙]",
-      ...recommendOutputRules(
-        active,
-        holdings.some((h) => !active.includes(h.category)),
-      ),
+      ...recommendOutputRules(active),
     ].join("\n");
 
     const res = await runCodex({
@@ -546,26 +560,34 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
     }
 
     const month = monthKeyKST();
+    // 모델의 ref_price는 [실시간 시세] 값이다. research_price에는 ② 문서 표의 가격을
+    // 넣어야 applyRealtimePrices의 ±30% 검사가 ② 오파싱을 잡아낸다.
+    const researchPrices = new Map(
+      freshParsed.dataRows
+        .filter((r) => r.price !== null && r.price > 0)
+        .map((r) => [r.ticker, r.price!] as const),
+    );
+    // 재배분 전 잔액 — 정규화와 applyRealtimePrices가 같은 값을 써야 이월액이 어긋나지 않는다
+    const normalizeBalances = activeBalances(balances, active);
     const { rows: normalized, dropped } = normalizePicks(picks, {
-      balances: activeBalances(balances, active),
+      balances: normalizeBalances,
       injectedDocIds: [research.docId!, ...priorDocs.map((d) => d.id)],
-      // 갈아타기 제안의 매도 종목·수량을 실제 보유와 대조하기 위해 넘긴다
-      holdings: activeHoldings(holdings, active),
       active,
+      roleWeights,
+      researchPrices,
     });
 
     // 조사 문서의 가격은 이미 묵은 값이다. 증권사 앱과 같은 값으로 사려면
     // 추천 시점의 체결가로 기준가를 갈아끼우고 수량을 다시 센다 (원값은 researchPrice에).
     const quoteTickers = [
       ...new Set(
-        normalized
-          .flatMap((r) => [r.ticker, r.sellTicker])
-          .filter((t): t is string => Boolean(t)),
+        normalized.map((r) => r.ticker).filter((t): t is string => Boolean(t)),
       ),
     ];
     const priced = applyRealtimePrices(
       normalized,
       quoteTickers.length ? await getRealtimePrices(quoteTickers) : new Map(),
+      normalizeBalances,
     );
 
     const rows = priced.rows.map((r) => ({ ...r, runId: run.id, month }));

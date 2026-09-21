@@ -9,6 +9,7 @@
     "lint": "eslint",
     "check:ledger": "tsx --env-file=.env.local scripts/check-ledger.ts",
     "db:push": "drizzle-kit push",
+    "db:reset": "tsx scripts/reset-db.ts",
     "check:parser": "tsx scripts/check-parser.ts",
     "recommend:once": "tsx --env-file=.env.local scripts/run-recommend-once.ts",
     "prompts:load": "tsx --env-file=.env.local scripts/load-prompts.ts",
@@ -29,7 +30,8 @@
     "check:accept": "tsx scripts/check-accept.ts",
     "check:switch": "tsx scripts/check-switch.ts",
     "check:purchase-guard": "tsx scripts/check-purchase-guard.ts",
-    "check:quotes": "tsx scripts/check-quotes.ts"
+    "check:quotes": "tsx scripts/check-quotes.ts",
+    "check:guard": "tsx scripts/check-guard.ts"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.1.0",

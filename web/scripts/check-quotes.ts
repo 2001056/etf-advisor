@@ -4,9 +4,10 @@
  */
 import { sql } from "drizzle-orm";
 import { db } from "../src/db";
-import { purchases, researchDocs, sales, settings } from "../src/db/schema";
+import { purchases, researchDocs, sales } from "../src/db/schema";
 import { Category } from "../src/domain/money";
 import { getQuotes } from "../src/domain/quotes";
+import { guardAgainstRealData } from "./lib/guard";
 
 let failed = 0;
 function check(label: string, actual: unknown, expected: unknown) {
@@ -17,20 +18,6 @@ function check(label: string, actual: unknown, expected: unknown) {
     console.log(
       `      기대=${JSON.stringify(expected)}\n      실제=${JSON.stringify(actual)}`,
     );
-  }
-}
-
-async function guardAgainstRealData() {
-  const [row] = await db
-    .select({
-      n: sql<number>`(select count(*) from ${purchases})::int + (select count(*) from ${settings})::int + (select count(*) from ${researchDocs})::int`,
-    })
-    .from(sql`(select 1) as _`);
-  if (Number(row?.n ?? 0) > 0 && process.env.ALLOW_WIPE !== "1") {
-    console.error(
-      "데이터가 있는 DB입니다. 검증용 DB(etf_advisor_test)에서 실행하세요.",
-    );
-    process.exit(2);
   }
 }
 

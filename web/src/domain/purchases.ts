@@ -1,7 +1,8 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { ledger, purchases, sales } from "@/db/schema";
+import { ledger, purchases, recommendations, sales } from "@/db/schema";
 import { Category, CATEGORY_LABEL, dateKeyKST } from "./money";
+import { GrowthRole, toGrowthRole } from "./recommendation";
 
 /** db.transaction 콜백이 받는 트랜잭션 핸들 타입 — *Tx 코어 함수들이 공유한다. */
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -135,6 +136,65 @@ export function duplicateRecommendationMessage(e: unknown): string | null {
     cause?.constraint === "purchases_one_per_recommendation"
     ? "이 추천은 이미 매입으로 기록되었습니다"
     : null;
+}
+
+/**
+ * 추천을 매입으로 확정하기 전 선확인 — 막아야 하면 한국어 사유, 통과면 null.
+ *
+ * 갈아타기 재확정은 매도 단계가 먼저 터져 "보유분이 없습니다"류로 새는 탓에 여기서 끊는다.
+ * DB 유니크(purchases_one_per_recommendation)는 동시 제출용 최종 방어로 그대로 둔다.
+ *
+ * 화면(acceptRecommendationAction)과 검증(check-accept.ts)이 같은 함수를 불러야
+ * "검증은 통과인데 화면은 다른 메시지"가 생기지 않는다.
+ */
+export function acceptBlockReason(
+  rec: {
+    skipped: boolean;
+    ticker: string | null;
+    sellTicker: string | null;
+  },
+  alreadyAccepted: boolean,
+): string | null {
+  if (rec.skipped || !rec.ticker) {
+    return "건너뛴 추천은 매입 기록으로 옮길 수 없습니다";
+  }
+  if (rec.sellTicker) {
+    return "옛 갈아타기 추천입니다. /switch 화면에서 직접 기록하세요";
+  }
+  if (alreadyAccepted) {
+    return "이 추천은 이미 매입으로 기록되었습니다";
+  }
+  return null;
+}
+
+/**
+ * 보유 종목이 어느 자리(공격·안정)로 산 것인지. 키는 `카테고리::종목코드`.
+ *
+ * ③ 추천을 통해 기록된 매입만 자리를 안다 — 수기 매입은 빠지고, 그 종목은
+ * 자리를 알 수 없는 것으로 다뤄야 한다(⑤가 임의로 통합 대상에 넣으면 안 된다).
+ * 같은 종목을 여러 자리로 산 적이 있으면 가장 최근 매입의 자리를 쓴다.
+ */
+export async function holdingRoles(): Promise<Map<string, GrowthRole>> {
+  const rows = await db
+    .select({
+      category: purchases.category,
+      ticker: purchases.ticker,
+      role: recommendations.role,
+    })
+    .from(purchases)
+    .innerJoin(
+      recommendations,
+      eq(purchases.recommendationId, recommendations.id),
+    )
+    .where(isNotNull(recommendations.role))
+    .orderBy(purchases.boughtAt, purchases.id);
+
+  const out = new Map<string, GrowthRole>();
+  for (const r of rows) {
+    const role = toGrowthRole(r.role);
+    if (role) out.set(`${r.category}::${r.ticker}`, role);
+  }
+  return out;
 }
 
 /** 이미 매입으로 기록된 추천 id — 추천 화면에서 확정 폼 대신 완료 표시를 띄운다 */

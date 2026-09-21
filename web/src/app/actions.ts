@@ -15,10 +15,12 @@ import {
 } from "@/lib/auth";
 import {
   closePurchaseCycle,
+  getMonthlyTopup,
   isOnboarded,
   seedInitialBalances,
   runLazyTopup,
   setMonthlyTopup,
+  setGrowthRoleWeights,
   getRecommendation,
   wasHighDivSkipped,
 } from "@/domain/ledger";
@@ -31,11 +33,17 @@ import {
 } from "@/server/orchestrator";
 import { PromptSlot, savePrompt } from "@/domain/prompts";
 import {
+  activeCategories,
+  GROWTH_ROLES,
+  GrowthRole,
+} from "@/domain/recommendation";
+import {
   deleteAllResearchDocs,
   deleteResearchDocs,
 } from "@/domain/research";
 import { addDividend, deleteDividend } from "@/domain/dividends";
 import {
+  acceptBlockReason,
   acceptedRecommendationIds,
   addManualPurchase,
   addPurchaseWithHighDivTransfer,
@@ -394,63 +402,63 @@ export async function saveTopupAction(formData: FormData) {
   return { ok: true };
 }
 
+/** 자산성장 두 자리(공격·안정)의 비중. 합이 1이 아니면 배정액이 잔액을 벗어난다 */
+export async function saveGrowthRolesAction(formData: FormData) {
+  await requireSession();
+
+  const entries = GROWTH_ROLES.map((r) => {
+    const raw = String(formData.get(r) ?? "").trim();
+    const n = Number(raw.replace(/[,\s%]/g, ""));
+    if (!raw || !Number.isFinite(n) || n <= 0 || n >= 100) {
+      throw new Error("자리 비중은 0보다 크고 100보다 작은 숫자여야 합니다");
+    }
+    return [r, n / 100] as const;
+  });
+
+  // 여기는 사람이 방금 입력한 값이라 100%를 정확히 맞추게 한다.
+  // normalizeRoleWeights(0.02)는 이미 저장된 값을 읽을 때의 완화된 기준이다.
+  const sum = entries.reduce((a, [, v]) => a + v, 0);
+  if (Math.abs(sum - 1) > 0.001) {
+    throw new Error(
+      `두 자리의 비중 합이 100%가 되어야 합니다 (지금 ${Math.round(sum * 100)}%)`,
+    );
+  }
+
+  await setGrowthRoleWeights(
+    Object.fromEntries(entries) as Record<GrowthRole, number>,
+  );
+  revalidatePath("/settings");
+  revalidatePath("/recommend");
+  return { ok: true };
+}
+
 /** 추천 결과를 매입 기록으로 옮겨 담기 (§6 화면 4→5) */
 export async function acceptRecommendationAction(formData: FormData) {
   await requireSession();
   const id = num(formData.get("recommendationId"));
   const rec = await getRecommendation(id);
   if (!rec) return { error: "추천을 찾을 수 없습니다" };
-  if (rec.skipped || !rec.ticker) {
-    return { error: "건너뛴 추천은 매입 기록으로 옮길 수 없습니다" };
-  }
-  // 갈아타기 재확정은 매도 단계가 먼저 터져 "보유분이 없습니다"류로 새는 탓에 여기서 끊는다.
-  // DB 유니크는 동시 제출용 최종 방어로 그대로 둔다.
-  if ((await acceptedRecommendationIds([rec.id])).length > 0) {
-    return { error: "이 추천은 이미 매입으로 기록되었습니다" };
-  }
+  const blocked = acceptBlockReason(
+    rec,
+    (await acceptedRecommendationIds([rec.id])).length > 0,
+  );
+  if (blocked) return { error: blocked };
+  // ticker 없음은 acceptBlockReason이 이미 걸렀다 — 여기서는 타입만 좁힌다
+  const ticker = rec.ticker!;
 
-  // 같은 회차에서 고배당을 건너뛰었다면 그 잔액을 끌어와 쓸 수 있다 (§2.2 예외)
-  const highDivSkipped = await wasHighDivSkipped(rec.runId);
-
-  // 갈아타기 추천이면 매도→매수를 한 트랜잭션으로 (매도가 실패하면 매수도 안 된다)
-  if (rec.sellTicker) {
-    try {
-      await executeSwitch({
-        category: rec.category as Category,
-        executedAt: String(formData.get("boughtAt") || dateKeyKST()),
-        sell: {
-          ticker: rec.sellTicker,
-          qty: positiveNum(formData.get("sellQty"), "매도 수량"),
-          unitPrice: positiveNum(formData.get("sellUnitPrice"), "매도 체결 단가"),
-        },
-        buy: {
-          ticker: rec.ticker,
-          etfName: rec.etfName ?? rec.ticker,
-          qty: positiveNum(formData.get("qty"), "수량"),
-          unitPrice: positiveNum(formData.get("unitPrice"), "체결 단가"),
-        },
-        recommendationId: rec.id,
-        allowHighDivTransfer: highDivSkipped,
-      });
-    } catch (e) {
-      const dup = duplicateRecommendationMessage(e);
-      if (dup) return { error: dup };
-      return { error: e instanceof Error ? e.message : String(e) };
-    }
-
-    revalidatePath("/purchases");
-    revalidatePath("/switch");
-    revalidatePath("/");
-    return { ok: true };
-  }
+  // 같은 회차에서 고배당을 건너뛰었다면 그 잔액을 끌어와 쓸 수 있다 (§2.2 예외).
+  // 고배당이 비활성이면 그 잔돈은 이번 회차 재원이 아니므로 끌어오지 않는다.
+  const highDivSkipped =
+    (await wasHighDivSkipped(rec.runId)) &&
+    activeCategories(await getMonthlyTopup()).includes("high_div");
 
   try {
     await addPurchaseWithHighDivTransfer(
       {
         boughtAt: String(formData.get("boughtAt") || dateKeyKST()),
         category: rec.category as Category,
-        ticker: rec.ticker,
-        etfName: rec.etfName ?? rec.ticker,
+        ticker,
+        etfName: rec.etfName ?? ticker,
         qty: positiveNum(formData.get("qty"), "수량"),
         unitPrice: positiveNum(formData.get("unitPrice"), "체결 단가"),
         recommendationId: rec.id,

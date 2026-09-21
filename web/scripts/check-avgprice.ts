@@ -4,6 +4,7 @@ import { db } from "../src/db";
 import { ledger, purchases, settings } from "../src/db/schema";
 import { seedInitialBalances } from "../src/domain/ledger";
 import { addPurchase, getHoldings, deletePurchase, updatePurchase, listPurchases } from "../src/domain/purchases";
+import { guardAgainstRealData } from "./lib/guard";
 
 let failed = 0;
 function check(l: string, a: unknown, e: unknown) {
@@ -13,10 +14,7 @@ function check(l: string, a: unknown, e: unknown) {
 }
 
 async function main() {
-  const g = await db.select({ n: sql<number>`(select count(*) from ${purchases})::int` }).from(sql`(select 1) as _`);
-  if (Number(g[0]?.n ?? 0) > 0 && process.env.ALLOW_WIPE !== "1") {
-    console.error("데이터가 있는 DB입니다."); process.exit(2);
-  }
+  await guardAgainstRealData();
   await db.execute(sql`truncate ${ledger}, ${purchases}, ${settings} restart identity cascade`);
   await seedInitialBalances({ div_growth: 10_000_000, asset_growth: 10_000_000, high_div: 10_000_000 });
 

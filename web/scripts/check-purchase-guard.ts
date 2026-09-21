@@ -15,6 +15,7 @@ import {
 } from "../src/db/schema";
 import { getBalances, seedInitialBalances } from "../src/domain/ledger";
 import { addManualPurchase } from "../src/domain/purchases";
+import { guardAgainstRealData } from "./lib/guard";
 
 let failed = 0;
 function check(label: string, actual: unknown, expected: unknown) {
@@ -65,17 +66,7 @@ const buy = (category: "div_growth" | "high_div", qty: number, price: number) =>
 });
 
 async function main() {
-  const [guard] = await db
-    .select({
-      n: sql<number>`(select count(*) from ${purchases})::int + (select count(*) from ${settings})::int`,
-    })
-    .from(sql`(select 1) as _`);
-  if (Number(guard?.n ?? 0) > 0 && process.env.ALLOW_WIPE !== "1") {
-    console.error(
-      "데이터가 있는 DB입니다. 검증용 DB(etf_advisor_test)에서 실행하세요.",
-    );
-    process.exit(2);
-  }
+  await guardAgainstRealData();
 
   const seed = { div_growth: 350_000, asset_growth: 0, high_div: 0 };
 

@@ -1,13 +1,19 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { desc, isNull } from "drizzle-orm";
 import { db } from "@/db";
-import { agentRuns, holdingAlerts, researchDocs } from "@/db/schema";
-import { buildFormatInstruction, parseResearchDoc } from "@/domain/docFormat";
-import { checkDocument, issuesToProblems } from "@/domain/dataChecks";
-import { getHoldings } from "@/domain/purchases";
+import { holdingAlerts, researchDocs } from "@/db/schema";
+import { buildFormatInstruction } from "@/domain/docFormat";
+import { getMonthlyTopup } from "@/domain/ledger";
+import { getHoldings, holdingRoles } from "@/domain/purchases";
 import { getPrompt } from "@/domain/prompts";
-import { extractJson } from "@/domain/recommendation";
+import {
+  activeCategories,
+  extractJson,
+  GrowthRole,
+  GROWTH_ROLE_LABEL,
+  ROLE_CATEGORY,
+} from "@/domain/recommendation";
 import { CATEGORY_LABEL, Category, dateKeyKST } from "@/domain/money";
 import { researchPath } from "./paths";
 
@@ -74,14 +80,20 @@ export type WatchOutcome = {
 };
 
 /** ④의 프롬프트 뒤에 붙는 출력 계약 */
-function buildAlertInstruction(
+export function buildAlertInstruction(
   holdings: { ticker: string; etfName: string; category: Category; qty: number; avgPrice: number }[],
+  opts: { roles?: Map<string, GrowthRole>; active?: Category[] } = {},
 ): string {
   const lines = holdings
-    .map(
-      (h) =>
-        `- ${CATEGORY_LABEL[h.category]} | ${h.ticker} ${h.etfName} | ${h.qty}주 | 평단가 ${h.avgPrice.toLocaleString("ko-KR")}원`,
-    )
+    .map((h) => {
+      const role = opts.roles?.get(`${h.category}::${h.ticker}`);
+      const inactive = opts.active ? !opts.active.includes(h.category) : false;
+      return (
+        `- ${CATEGORY_LABEL[h.category]} | ${h.ticker} ${h.etfName} | ${h.qty}주 | 평단가 ${h.avgPrice.toLocaleString("ko-KR")}원` +
+        (role ? ` | ${GROWTH_ROLE_LABEL[role]} 자리` : "") +
+        (inactive ? " (적립 중단 카테고리)" : "")
+      );
+    })
     .join("\n");
 
   return `
@@ -97,12 +109,16 @@ ${lines}
   상장폐지·거래정지, 운용전략의 중대한 변경, 분배 재원이 원금을 깎고 있다는 확인된 신호,
   순자산 급감으로 유동성이 위험한 경우처럼 구조적 문제일 때만 해당한다.
 - action=sell이면 replacement_ticker/replacement_name에 **같은 카테고리**의 대체 종목을 넣어라.
+  ${CATEGORY_LABEL[ROLE_CATEGORY]} 보유의 대체 종목은 **같은 자리**에서 고른다.
   대체 후보를 못 찾으면 둘 다 null로 두고 rationale에 이유를 적어라.
+- **(적립 중단 카테고리)로 표시된 보유는 위험 판정은 똑같이 하되 대체 종목을 제시하지 마라.**
+  replacement는 둘 다 null로 두고, 매도·이동 여부는 사람이 결정한다.
 - sell이 아니면 replacement는 둘 다 null이다.
 - issue는 무엇이 문제인지 한 줄. 문제가 없으면 "이상 없음"이라고 쓴다.
 - rationale에는 판정 근거를 수치와 함께 적는다. 추측이면 추측이라고 밝혀라.
 - source_urls에는 그 판정을 뒷받침하는 실제 URL만 넣는다.
-- 매도는 세금·재매수 비용이 따르는 되돌리기 어려운 행동이다. 확신이 없으면 warn/hold로 둬라.
+- 매도는 되돌리기 어려운 행동이고 매도 손익은 계좌 정산에 반영된다(즉시 과세는 아니다). 재매수 비용도 든다.
+  자료가 부족해 판단이 서지 않으면 위험 판정 대신 "확인 불가"로 남기고 hold로 둬라.
 
 반드시 지정된 JSON 스키마로만 응답하라.`.trim();
 }
@@ -111,6 +127,8 @@ ${lines}
 export function normalizeAlerts(
   raw: unknown,
   holdings: { ticker: string; etfName: string; category: Category }[],
+  /** 이번 회차 적립이 도는 카테고리. 주면 그 밖의 보유는 대체 종목을 비운다 */
+  active?: Category[],
 ): { rows: Omit<typeof holdingAlerts.$inferInsert, "runId" | "docId">[]; dropped: string[] } {
   const list = Array.isArray(raw)
     ? raw
@@ -145,6 +163,12 @@ export function normalizeAlerts(
 
     const isSell = action === "sell";
     const rt = String(a.replacement_ticker ?? "").replace(/[^0-9A-Za-z]/g, "");
+    // 적립을 멈춘 카테고리는 이번 회차 재원이 없다 — 갈아탈 곳을 시스템이 권하지 않는다
+    const inactive = active ? !active.includes(held.category) : false;
+    const keepReplacement = isSell && Boolean(rt) && !inactive;
+    if (isSell && rt && inactive) {
+      dropped.push(`적립 중단 카테고리라 대체 종목 제외: ${ticker}`);
+    }
 
     rows.push({
       ticker,
@@ -153,9 +177,10 @@ export function normalizeAlerts(
       severity: severity as "info" | "warn" | "danger",
       action: action as "hold" | "stop_buying" | "sell",
       issue: String(a.issue ?? "").slice(0, 500) || "이상 없음",
-      replacementTicker: isSell && rt ? rt : null,
-      replacementName:
-        isSell && rt ? String(a.replacement_name ?? "") || null : null,
+      replacementTicker: keepReplacement ? rt : null,
+      replacementName: keepReplacement
+        ? String(a.replacement_name ?? "") || null
+        : null,
       rationale: String(a.rationale ?? ""),
       sourceUrls: Array.isArray(a.source_urls)
         ? a.source_urls.filter((u): u is string => typeof u === "string")
@@ -196,7 +221,11 @@ export async function runHoldingWatch(
   deps: WatchDeps,
   trigger: "schedule" | "user" = "schedule",
 ): Promise<WatchOutcome> {
-  const holdings = await getHoldings();
+  const [holdings, roles, active] = await Promise.all([
+    getHoldings(),
+    holdingRoles(),
+    getMonthlyTopup().then(activeCategories),
+  ]);
   if (!holdings.length) {
     return { runId: 0, docId: null, alerts: 0, danger: 0, skipped: true };
   }
@@ -221,7 +250,7 @@ export async function runHoldingWatch(
         runId: run.id,
         tickers: holdings.map((h) => h.ticker),
       }),
-      buildAlertInstruction(holdings),
+      buildAlertInstruction(holdings, { roles, active }),
     ].join("\n\n");
 
     const res = await deps.run({
@@ -245,7 +274,7 @@ export async function runHoldingWatch(
     }
 
     const parsedJson = extractJson(res.output);
-    const { rows, dropped } = normalizeAlerts(parsedJson, holdings);
+    const { rows, dropped } = normalizeAlerts(parsedJson, holdings, active);
 
     // 판정 근거를 사람이 읽을 수 있게 문서로도 남긴다 (type=watch — ③ 주입 대상 아님)
     const md = [

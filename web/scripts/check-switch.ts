@@ -24,6 +24,7 @@ import {
   listPurchases,
 } from "../src/domain/purchases";
 import { allocateBudgets, computeRefQty } from "../src/domain/recommendation";
+import { guardAgainstRealData } from "./lib/guard";
 
 let failed = 0;
 function check(label: string, actual: unknown, expected: unknown) {
@@ -124,17 +125,7 @@ async function messageOf(fn: () => Promise<unknown>) {
 }
 
 async function main() {
-  const [guard] = await db
-    .select({
-      n: sql<number>`(select count(*) from ${purchases})::int + (select count(*) from ${settings})::int`,
-    })
-    .from(sql`(select 1) as _`);
-  if (Number(guard?.n ?? 0) > 0 && process.env.ALLOW_WIPE !== "1") {
-    console.error(
-      "데이터가 있는 DB입니다. 검증용 DB(etf_advisor_test)에서 실행하세요.",
-    );
-    process.exit(2);
-  }
+  await guardAgainstRealData();
 
   console.log("=== 시나리오 1: 갈아타기 매수 행은 개별 삭제되지 않는다 ===");
   await reset();

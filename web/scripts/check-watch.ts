@@ -1,6 +1,7 @@
 /** ④ 보유 점검 판정 정규화 검증 — pnpm run check:watch (DB 불필요) */
-import { normalizeAlerts } from "../src/server/watch";
+import { buildAlertInstruction, normalizeAlerts } from "../src/server/watch";
 import { Category } from "../src/domain/money";
+import { GrowthRole } from "../src/domain/recommendation";
 
 let failed = 0;
 function check(l: string, ok: boolean, d = "") {
@@ -41,21 +42,50 @@ check("잘못된 action 버림", normalizeAlerts({ alerts: [a({ action: "panic" 
 console.log("\n=== 매도 제안 ===");
 const sell = normalizeAlerts({ alerts: [a({
   severity: "danger", action: "sell",
-  replacement_ticker: "458730", replacement_name: "TIGER 미국배당다우존스",
+  replacement_ticker: "446720", replacement_name: "SOL 미국배당다우존스",
   issue: "분배 재원이 원금 잠식", source_urls: ["https://a", 5, null],
 })] }, HOLD);
-check("대체 종목 유지", sell.rows[0].replacementTicker === "458730");
-check("대체 종목명 유지", sell.rows[0].replacementName === "TIGER 미국배당다우존스");
+check("대체 종목 유지", sell.rows[0].replacementTicker === "446720");
+check("대체 종목명 유지", sell.rows[0].replacementName === "SOL 미국배당다우존스");
 check("URL 중 문자열만", JSON.stringify(sell.rows[0].sourceUrls) === '["https://a"]');
 
 console.log("\n=== sell이 아니면 대체 종목은 버린다 ===");
-const noSell = normalizeAlerts({ alerts: [a({ action: "hold", replacement_ticker: "458730", replacement_name: "X" })] }, HOLD);
+const noSell = normalizeAlerts({ alerts: [a({ action: "hold", replacement_ticker: "446720", replacement_name: "X" })] }, HOLD);
 check("replacement null", noSell.rows[0].replacementTicker === null && noSell.rows[0].replacementName === null);
 
 console.log("\n=== sell인데 대체를 못 찾은 경우 ===");
 const sellNoRep = normalizeAlerts({ alerts: [a({ severity: "danger", action: "sell" })] }, HOLD);
 check("판정은 살아남음", sellNoRep.rows.length === 1);
 check("replacement null 허용", sellNoRep.rows[0].replacementTicker === null);
+
+console.log("\n=== 적립 중단 카테고리 보유는 대체 종목을 비운다 ===");
+const SELL = { severity: "danger", action: "sell", replacement_ticker: "446720", replacement_name: "SOL 미국배당다우존스" };
+const inactive = normalizeAlerts({ alerts: [a(SELL)] }, HOLD, ["high_div"]);
+check("판정은 그대로 살아남는다", inactive.rows.length === 1);
+check("severity·action 유지", inactive.rows[0].severity === "danger" && inactive.rows[0].action === "sell");
+check("replacement 비움", inactive.rows[0].replacementTicker === null && inactive.rows[0].replacementName === null);
+check("사유 기록", inactive.dropped.some((d) => d.includes("적립 중단 카테고리라 대체 종목 제외")));
+check("대조군: 활성 카테고리면 대체 종목을 그대로 둔다",
+  normalizeAlerts({ alerts: [a(SELL)] }, HOLD, ["div_growth", "high_div"]).rows[0].replacementTicker === "446720");
+check("대조군: 활성 목록을 안 주면 예전처럼 그대로",
+  normalizeAlerts({ alerts: [a(SELL)] }, HOLD).rows[0].replacementTicker === "446720");
+
+console.log("\n=== 점검 대상 줄에 자리와 적립 중단 표시 ===");
+const HOLD_FULL = [
+  { ticker: "379800", etfName: "KODEX 미국S&P500", category: "asset_growth" as Category, qty: 10, avgPrice: 20_000 },
+  { ticker: "490600", etfName: "RISE 커버드콜", category: "high_div" as Category, qty: 5, avgPrice: 10_000 },
+];
+const instruction = buildAlertInstruction(HOLD_FULL, {
+  roles: new Map([["asset_growth::379800", "stable" as GrowthRole]]),
+  active: ["asset_growth"],
+});
+check("자리 표시", instruction.includes("379800 KODEX 미국S&P500 | 10주 | 평단가 20,000원 | 안정적 성장 자리"));
+check("적립 중단 표시", instruction.includes("490600 RISE 커버드콜 | 5주 | 평단가 10,000원 (적립 중단 카테고리)"));
+check("활성 카테고리에는 표시 없음", !instruction.includes("자리 (적립 중단 카테고리)"));
+check("대체 종목 금지 규칙이 들어 있다", instruction.includes("대체 종목을 제시하지 마라"));
+check("자산성장은 같은 자리에서 고른다", instruction.includes("같은 자리**에서 고른다"));
+check("대조군: 자리·활성 정보를 안 주면 줄이 예전 그대로",
+  buildAlertInstruction(HOLD_FULL).includes("- 고배당 | 490600 RISE 커버드콜 | 5주 | 평단가 10,000원\n"));
 
 console.log("\n=== 비정상 입력 ===");
 check("빈 배열", normalizeAlerts({ alerts: [] }, HOLD).rows.length === 0);

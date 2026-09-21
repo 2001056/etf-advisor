@@ -9,9 +9,11 @@ import {
   monthsAfter,
   nextMonth,
 } from "./money";
+import { GrowthRole, normalizeRoleWeights } from "./recommendation";
 
 const BASELINE_KEY = "topup_baseline_month";
 const TOPUP_KEY = "monthly_topup";
+const GROWTH_ROLES_KEY = "growth_roles";
 
 /** 카테고리별 잔액. 저장하지 않고 항상 원장 합계로 파생한다 (§7). */
 export async function getBalances(): Promise<Record<Category, number>> {
@@ -51,6 +53,30 @@ export async function getMonthlyTopup(): Promise<Record<Category, number>> {
     .limit(1);
   if (!row.length) return { ...DEFAULT_MONTHLY_TOPUP };
   return row[0].value as Record<Category, number>;
+}
+
+/** 자산성장 두 자리(공격·안정)의 비중. 저장값이 깨져 있으면 기본 50:50으로 읽는다 */
+export async function getGrowthRoleWeights(): Promise<
+  Record<GrowthRole, number>
+> {
+  const row = await db
+    .select()
+    .from(settings)
+    .where(eq(settings.key, GROWTH_ROLES_KEY))
+    .limit(1);
+  return normalizeRoleWeights(row[0]?.value);
+}
+
+export async function setGrowthRoleWeights(
+  value: Record<GrowthRole, number>,
+): Promise<void> {
+  await db
+    .insert(settings)
+    .values({ key: GROWTH_ROLES_KEY, value })
+    .onConflictDoUpdate({
+      target: settings.key,
+      set: { value, updatedAt: new Date() },
+    });
 }
 
 async function getBaselineMonth(): Promise<string | null> {

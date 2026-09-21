@@ -4,7 +4,8 @@ import { desc } from "drizzle-orm";
 import { db } from "@/db";
 import { agentRuns, researchDocs } from "@/db/schema";
 import { getBalances, getCycle, isOnboarded, runLazyTopup } from "@/domain/ledger";
-import { getHoldings } from "@/domain/purchases";
+import { getHoldings, holdingRoles } from "@/domain/purchases";
+import { GROWTH_ROLE_LABEL } from "@/domain/recommendation";
 import { getQuotes } from "@/domain/quotes";
 import { getLivePrices } from "@/server/livePrice";
 import { dividendsByTicker, returnByCategory } from "@/domain/dividends";
@@ -91,9 +92,10 @@ export default async function DashboardPage() {
   // 총수익 = 평가손익 + 받은 분배금
   const priceOf = (t: string) =>
     live.get(t)?.price ?? quotes.get(t)?.price ?? null;
-  const [alerts, consolidations] = await Promise.all([
+  const [alerts, consolidations, roles] = await Promise.all([
     openAlerts(),
     openConsolidations(),
+    holdingRoles(),
   ]);
   const [ret, divByTicker, divTotals, topup] = await Promise.all([
     returnByCategory(holdings, priceOf),
@@ -620,7 +622,18 @@ export default async function DashboardPage() {
                     key={`${h.category}-${h.ticker}`}
                     className="border-b border-neutral-100"
                   >
-                    <td className="py-2">{CATEGORY_LABEL[h.category]}</td>
+                    <td className="py-2">
+                      {CATEGORY_LABEL[h.category]}
+                      {roles.get(`${h.category}::${h.ticker}`) && (
+                        <span className="ml-1 rounded bg-indigo-100 px-1.5 py-0.5 text-xs text-indigo-800">
+                          {
+                            GROWTH_ROLE_LABEL[
+                              roles.get(`${h.category}::${h.ticker}`)!
+                            ]
+                          }
+                        </span>
+                      )}
+                    </td>
                     <td>
                       {h.etfName}{" "}
                       <span className="text-neutral-400">{h.ticker}</span>

@@ -6,7 +6,6 @@ import {
   activeBalances,
   activeCategories,
   activeCategoriesLine,
-  activeHoldings,
   allocateBudgets,
   applyRealtimePrices,
   budgetLine,
@@ -14,10 +13,15 @@ import {
   extractJson,
   holdingLine,
   isDrift,
+  NormalizedPick,
   normalizePicks,
+  normalizeRoleWeights,
   positiveInt,
+  realtimePriceBlock,
   recommendOutputRules,
   researchTickers,
+  roleBudgetLine,
+  seatBudget,
   toInt,
 } from "../src/domain/recommendation";
 import { Category, isMarketOpenKST } from "../src/domain/money";
@@ -100,7 +104,14 @@ const buy = normalizePicks(
   ctx,
 );
 check("3건 정규화", buy.rows.length, 3);
-check("버려진 것 없음", buy.dropped.length, 0);
+check(
+  "자산성장 pick 1개라 자리 자동 배정·빈 자리 이월 2건만 기록",
+  buy.dropped,
+  [
+    "자산성장 pick에 role이 없어 공격적 성장 자리로 배정 — 360750",
+    "자산성장 자리 1개가 비어 그 몫은 자산성장 잔액으로 이월",
+  ],
+);
 check("배정 금액은 시스템 잔액으로 덮어씀", buy.rows[0].budgetKrw, 350_000);
 check("수량 유지", buy.rows[0].refQty, 24);
 check("skipped=false", buy.rows[0].skipped, false);
@@ -151,7 +162,11 @@ const messy = normalizePicks(
 check("소수 가격 절삭", messy.rows[0].refPrice, 14110);
 check("소수 수량 절삭", messy.rows[0].refQty, 24);
 check("공백 카테고리 인식", messy.rows[1].category, "asset_growth");
-check("알 수 없는 카테고리는 버림", messy.dropped.length, 1);
+check(
+  "알 수 없는 카테고리는 버림",
+  messy.dropped.filter((d) => d.includes("채권")).length,
+  1,
+);
 check("버린 이유 기록", messy.dropped[0].includes("채권"), true);
 check("가격 없으면 건너뜀", messy.rows[2].skipped, true);
 
@@ -244,9 +259,14 @@ const byCat = Object.fromEntries(redistributed.rows.map((r) => [r.category, r]))
 // 배당성장 437,500 ÷ 14,000 = 31.25 → 31주 (재배분 전이면 25주)
 check("배당성장 배정액", byCat.div_growth.budgetKrw, 437_500);
 check("배당성장 수량(재배분 반영)", byCat.div_growth.refQty, 31);
-// 자산성장 262,500 ÷ 26,000 = 10.09 → 10주 (재배분 전이면 8주)
-check("자산성장 배정액", byCat.asset_growth.budgetKrw, 262_500);
-check("자산성장 수량(재배분 반영)", byCat.asset_growth.refQty, 10);
+// 자산성장 262,500의 공격 자리 몫 131,250 ÷ 26,000 = 5.04 → 5주
+check("자산성장 자리 배정액", byCat.asset_growth.budgetKrw, 131_250);
+check("자산성장 수량(재배분 반영)", byCat.asset_growth.refQty, 5);
+check(
+  "  대조군: 자리를 안 나눴다면 floor(262500/26000)",
+  computeRefQty(262_500, 0, 26_000),
+  10,
+);
 // 건너뛴 고배당은 자기 잔액을 이월액으로 표시
 check("고배당 이월액", byCat.high_div.budgetKrw, 140_000);
 check("고배당 skipped", byCat.high_div.skipped, true);
@@ -312,9 +332,11 @@ const base = normalizePicks(
       { category: "고배당", action: "skip", ticker: null, etf_name: null, ref_price: null, ref_qty: 0, rationale: "", source_doc_ids: [], source_urls: [] },
     ],
   },
-  ctx,
+  // ② 표 가격 = 모델이 적어 온 ref_price 와 같은 경우
+  { ...ctx, researchPrices: new Map([["446720", 14_000], ["133690", 21_000]]) },
 ).rows;
 check("교체 전 배당성장 수량", base[0].refQty, 31);
+check("교체 전 자산성장 수량 floor(131250/21000)", base[1].refQty, 6);
 check("교체 전 출처는 조사", base[0].priceSource, "research");
 
 const swapped = applyRealtimePrices(
@@ -326,13 +348,190 @@ check("수량 재계산 floor(437500/12500)", swapped[0].refQty, 35);
 check("조사 가격은 남는다", swapped[0].researchPrice, 14_000);
 check("출처는 실시간", swapped[0].priceSource, "realtime");
 check("기준 시각 기록", swapped[0].pricedAt?.toISOString(), pricedAt.toISOString());
-check("실시간가 없는 종목은 조사가 유지", swapped[1].refPrice, 21_000);
-check("  수량도 그대로", swapped[1].refQty, 12);
+check("실시간가 없는 종목은 이번 회차에서 빠진다", swapped[1].skipped, true);
+check("  기준가를 조사가로 대체하지 않는다", swapped[1].refPrice, null);
+check("  수량 0", swapped[1].refQty, 0);
+check("  종목도 비운다", [swapped[1].ticker, swapped[1].etfName], [null, null]);
 check("  출처도 조사 그대로", swapped[1].priceSource, "research");
 check("  기준 시각 없음", swapped[1].pricedAt, null);
+check(
+  "  사유를 rationale 에 남긴다",
+  swapped[1].rationale.includes("133690 실시간가 없음 — 이번 회차 제외"),
+  true,
+);
+check(
+  "  자리 몫은 그대로 남아 이월된다",
+  swapped[1].budgetKrw,
+  base[1].budgetKrw,
+);
 check("skip은 null 유지", swapped[2].refPrice, null);
 check("  skip 출처도 조사", swapped[2].priceSource, "research");
 check("  skip 수량 0", swapped[2].refQty, 0);
+
+console.log("\n=== research_price 는 ② 문서 표의 가격이다 (모델 ref_price 가 아니다) ===");
+const v3Picks = [
+  { category: "배당성장", action: "buy", ticker: "446720", etf_name: "A", ref_price: 12_380, ref_qty: 28, rationale: "", source_doc_ids: [], source_urls: [] },
+  { category: "자산성장", action: "buy", ticker: "133690", etf_name: "B", ref_price: 21_000, ref_qty: 10, rationale: "", source_doc_ids: [], source_urls: [] },
+];
+// ③ 출력 규칙이 "ref_price 는 [실시간 시세] 값" 이라 모델 값은 실시간가다.
+// ② 문서 표에서 읽은 12,000 이 research_price 가 되어야 ② 오파싱 탐지가 성립한다.
+const fromDoc = normalizePicks(
+  { picks: v3Picks },
+  { ...ctx, researchPrices: new Map([["446720", 12_000]]) },
+).rows;
+check("② 표 가격이 research_price", fromDoc[0].researchPrice, 12_000);
+check("  기준가는 모델이 적어 온 실시간가 그대로", fromDoc[0].refPrice, 12_380);
+check("② 표에 없는 티커는 null", fromDoc[1].researchPrice, null);
+check(
+  "대조군: ② 표를 안 넘기면 전부 null (실시간가를 베껴 넣지 않는다)",
+  normalizePicks({ picks: v3Picks }, ctx).rows.map((r) => r.researchPrice),
+  [null, null],
+);
+check(
+  "건너뛴 행은 ② 표에 있어도 null",
+  normalizePicks(
+    { picks: [{ ...v3Picks[0], action: "skip", ticker: null, ref_price: null }] },
+    { ...ctx, researchPrices: new Map([["446720", 12_000]]) },
+  ).rows[0].researchPrice,
+  null,
+);
+
+console.log("\n=== isDrift 는 ② 가격을 기준으로 판정한다 (② 오파싱 탐지 복원) ===");
+const sane = applyRealtimePrices(
+  fromDoc,
+  new Map([["446720", { price: 12_400, pricedAt }]]),
+);
+check("② 12,000 대비 +3%면 실시간가로 교체", sane.rows[0].refPrice, 12_400);
+// ②를 1,200원으로 잘못 읽은 문서 — 실시간 12,400은 ② 기준 열 배가 넘는다
+const misparsed = normalizePicks(
+  { picks: v3Picks },
+  { ...ctx, researchPrices: new Map([["446720", 1_200]]) },
+).rows;
+const guarded = applyRealtimePrices(
+  misparsed,
+  new Map([["446720", { price: 12_400, pricedAt }]]),
+);
+check("② 오파싱이면 실시간가를 버리고 이번 회차에서 뺀다", guarded.rows[0].skipped, true);
+check("  조사가로 대체하지 않는다", guarded.rows[0].refPrice, null);
+check("  출처도 조사 그대로", guarded.rows[0].priceSource, "research");
+check(
+  "  사유를 남긴다",
+  guarded.excluded.includes("446720 실시간가가 조사가와 30% 넘게 차이 — 이번 회차 제외"),
+  true,
+);
+check(
+  "대조군: 실시간가가 있으면 그대로 매수 행으로 남는다",
+  [sane.rows[0].skipped, sane.rows[0].priceSource],
+  [false, "realtime"],
+);
+check("대조군: isDrift 자체도 ② 가격 기준", [isDrift(12_400, 1_200), isDrift(12_400, 12_000)], [true, false]);
+
+console.log("\n=== research_price 가 없으면 드리프트 검사를 건너뛰고 실시간가를 채택한다 ===");
+// ② 표에 없는 티커라 견줄 원값이 없다. 모델이 적어 온 ref_price 와 재면 실시간가끼리
+// 재는 꼴이라 검사가 성립하지 않는다 — 그럴 바엔 검사를 건너뛰고 실시간가를 쓴다.
+const noResearch = normalizePicks({ picks: v3Picks }, ctx).rows;
+check("전제: research_price 가 null", noResearch[0].researchPrice, null);
+const noResearchPriced = applyRealtimePrices(
+  noResearch,
+  // ref_price(12,380) 와 5배 넘게 벌어진 값이라 옛 기준(refPrice)이면 드리프트로 잘렸다
+  new Map([["446720", { price: 62_000, pricedAt }]]),
+);
+check("실시간가를 채택한다", noResearchPriced.rows[0].refPrice, 62_000);
+check("  매수 행으로 남는다", noResearchPriced.rows[0].skipped, false);
+check("  출처는 실시간", noResearchPriced.rows[0].priceSource, "realtime");
+check(
+  "  30% 제외 사유를 남기지 않는다",
+  noResearchPriced.excluded.some((e) => e.includes("30% 넘게 차이")),
+  false,
+);
+check(
+  "대조군: research_price 가 있고 30%를 넘으면 그대로 제외된다",
+  (() => {
+    const withResearch = applyRealtimePrices(
+      normalizePicks(
+        { picks: v3Picks },
+        { ...ctx, researchPrices: new Map([["446720", 12_000]]) },
+      ).rows,
+      new Map([["446720", { price: 62_000, pricedAt }]]),
+    );
+    return [
+      withResearch.rows[0].skipped,
+      withResearch.rows[0].refPrice,
+      withResearch.excluded.includes(
+        "446720 실시간가가 조사가와 30% 넘게 차이 — 이번 회차 제외",
+      ),
+    ];
+  })(),
+  [true, null, true],
+);
+check(
+  "대조군: isDrift 는 research 가 null 이면 언제나 false",
+  [isDrift(62_000, null), isDrift(62_000, 12_000)],
+  [false, true],
+);
+
+console.log("\n=== 실시간가는 필수다: 하나도 못 받으면 전부 건너뜀 ===");
+const blackout = applyRealtimePrices(base, new Map());
+check("매수 행이 전부 건너뜀", blackout.rows.map((r) => r.skipped), [true, true, true]);
+check("기준가도 전부 비었다", blackout.rows.map((r) => r.refPrice), [null, null, null]);
+check("수량도 전부 0", blackout.rows.map((r) => r.refQty), [0, 0, 0]);
+check("적용 0/2", [blackout.applied, blackout.eligible], [0, 2]);
+check(
+  "제외 사유 2건",
+  blackout.excluded,
+  ["446720 실시간가 없음 — 이번 회차 제외", "133690 실시간가 없음 — 이번 회차 제외"],
+);
+check(
+  "대조군: 둘 다 받으면 둘 다 매수로 남는다",
+  applyRealtimePrices(
+    base,
+    new Map([
+      ["446720", { price: 12_500, pricedAt }],
+      ["133690", { price: 20_000, pricedAt }],
+    ]),
+  ).rows.map((r) => [r.skipped, r.priceSource]),
+  [[false, "realtime"], [false, "realtime"], [true, "research"]],
+);
+
+console.log("\n=== 빼낸 행의 이월액은 정규화의 불변식과 같다 (비자리=재배분 전 잔액, 자리=자리 몫) ===");
+// base 는 고배당 명시 skip 이라 배당성장이 350,000 → 437,500 으로 재배분된 상태다.
+// 정규화에서 건너뛴 비자리 행은 재배분 전 350,000 을 이월액으로 들고 있으므로,
+// 실시간가가 없어 여기서 빠지는 행도 같은 350,000 이어야 한다.
+check(
+  "전제: 재배분으로 배당성장 배정이 부풀어 있다",
+  [base[0].weight, base[0].budgetKrw, base[1].weight, base[1].budgetKrw],
+  [null, 437_500, 0.5, 131_250],
+);
+const carried = applyRealtimePrices(base, new Map(), balances);
+check("비자리 행 이월액 = 재배분 전 잔액", carried.rows[0].budgetKrw, 350_000);
+check("  자리 행은 자리 몫 그대로", carried.rows[1].budgetKrw, 131_250);
+check(
+  "  정규화에서 건너뛴 행과 같은 값",
+  carried.rows[0].budgetKrw,
+  normalizePicks(
+    {
+      picks: [
+        { category: "배당성장", action: "skip", ticker: null, etf_name: null, ref_price: null, ref_qty: 0, rationale: "", source_doc_ids: [], source_urls: [] },
+        { category: "고배당", action: "skip", ticker: null, etf_name: null, ref_price: null, ref_qty: 0, rationale: "", source_doc_ids: [], source_urls: [] },
+      ],
+    },
+    ctx,
+  ).rows[0].budgetKrw,
+);
+check(
+  "대조군: balances 를 안 넘기면 재배분된 437,500 이 그대로 남는다",
+  applyRealtimePrices(base, new Map()).rows[0].budgetKrw,
+  437_500,
+);
+check(
+  "대조군: 매수로 남는 행의 배정액은 재배분된 값 그대로다",
+  applyRealtimePrices(
+    base,
+    new Map([["446720", { price: 12_500, pricedAt }]]),
+    balances,
+  ).rows[0].budgetKrw,
+  437_500,
+);
 
 console.log("\n=== 대조군: 실시간가 = 조사가면 수량이 안 바뀐다 ===");
 const same = applyRealtimePrices(
@@ -343,21 +542,37 @@ check("가격 동일", same[0].refPrice, 14_000);
 check("수량 불변", same[0].refQty, 31);
 check("출처만 실시간으로", same[0].priceSource, "realtime");
 
-console.log("\n=== 갈아타기도 매도가를 실시간으로 ===");
-const sw = normalizePicks(
+console.log("\n=== applyRealtimePrices는 매도 다리를 그대로 지원한다 (③은 더 이상 만들지 않는다) ===");
+// ③ 정규화가 매도를 만들지 않으므로 행을 직접 세워 교체 로직만 본다
+const sw: NormalizedPick[] = [
   {
-    picks: [
-      { category: "고배당", action: "switch", ticker: "490600", etf_name: "C", ref_price: 10_000, ref_qty: 0, sell_ticker: "458730", sell_qty: 10, sell_ref_price: 14_000, rationale: "", source_doc_ids: [], source_urls: [] },
-    ],
+    category: "high_div",
+    role: null,
+    weight: null,
+    ticker: "490600",
+    etfName: "C",
+    budgetKrw: 140_000,
+    refPrice: 10_000,
+    refQty: 28,
+    sellTicker: "251350",
+    sellQty: 10,
+    sellRefPrice: 14_000,
+    researchPrice: 10_000,
+    sellResearchPrice: 14_000,
+    priceSource: "research",
+    pricedAt: null,
+    skipped: false,
+    rationale: "",
+    sourceDocIds: [],
+    sourceUrls: [],
   },
-  { ...ctx, holdings: [{ category: "high_div" as Category, ticker: "458730", qty: 10 }] },
-).rows;
+];
 check("교체 전 수량 floor((140000+140000)/10000)", sw[0].refQty, 28);
 const swPriced = applyRealtimePrices(
   sw,
   new Map([
     ["490600", { price: 11_000, pricedAt }],
-    ["458730", { price: 15_000, pricedAt }],
+    ["251350", { price: 15_000, pricedAt }],
   ]),
 ).rows;
 check("매도가 교체", swPriced[0].sellRefPrice, 15_000);
@@ -367,7 +582,7 @@ check("수량 floor((140000+150000)/11000)", swPriced[0].refQty, 26);
 console.log("\n=== 매도 다리만 실시간이어도 출처는 실시간 ===");
 const sellOnly = applyRealtimePrices(
   sw,
-  new Map([["458730", { price: 15_000, pricedAt }]]),
+  new Map([["251350", { price: 15_000, pricedAt }]]),
 );
 check("매수가는 조사가 그대로", sellOnly.rows[0].refPrice, 10_000);
 check("매도가만 교체", sellOnly.rows[0].sellRefPrice, 15_000);
@@ -376,7 +591,7 @@ check("기준 시각 채움", sellOnly.rows[0].pricedAt?.toISOString(), pricedAt
 check("수량 floor((140000+150000)/10000)", sellOnly.rows[0].refQty, 29);
 check("적용 1/1", [sellOnly.applied, sellOnly.eligible], [1, 1]);
 
-console.log("\n=== 실시간가로 0주가 되면 교체하지 않는다 (skipped=false ∧ 수량 0 금지) ===");
+console.log("\n=== 실시간가로 0주가 되면 이번 회차에서 뺀다 (skipped=false ∧ 수량 0 금지) ===");
 const tinyCtx = {
   balances: { div_growth: 15_000, asset_growth: 0, high_div: 0 } as Record<Category, number>,
   injectedDocIds: [],
@@ -394,13 +609,19 @@ const raised = applyRealtimePrices(
   tiny,
   new Map([["446720", { price: 16_000, pricedAt }]]),
 );
-check("조사가 유지", raised.rows[0].refPrice, 14_000);
-check("조사 수량 유지", raised.rows[0].refQty, 1);
+check("조사가로 1주 남기지 않는다", raised.rows[0].refPrice, null);
+check("수량 0", raised.rows[0].refQty, 0);
 check("출처는 조사 그대로", raised.rows[0].priceSource, "research");
 check("기준 시각 없음", raised.rows[0].pricedAt, null);
-check("건너뜀 아님(원래대로)", raised.rows[0].skipped, false);
+check("건너뜀", raised.rows[0].skipped, true);
 check("적용 0/1", [raised.applied, raised.eligible], [0, 1]);
-check("제외 사유 기록", raised.excluded[0]?.includes("1주도 못 사서"), true);
+check("제외 사유 기록", raised.excluded[0], "446720 실시간가로는 1주도 못 산다 — 이번 회차 제외");
+check(
+  "대조군: 실시간가로도 1주를 살 수 있으면 그대로 매수",
+  applyRealtimePrices(tiny, new Map([["446720", { price: 13_000, pricedAt }]])).rows[0]
+    .skipped,
+  false,
+);
 
 console.log("\n=== 대조군: 이미 건너뛴 행은 가격이 떨어져도 되살아나지 않는다 ===");
 const revived = applyRealtimePrices(
@@ -418,10 +639,11 @@ const insane = applyRealtimePrices(
   base,
   new Map([["446720", { price: 20_000, pricedAt }]]),
 );
-check("조사가 유지", insane.rows[0].refPrice, 14_000);
-check("수량 유지", insane.rows[0].refQty, 31);
+check("조사가로 대체하지 않는다", insane.rows[0].refPrice, null);
+check("이번 회차에서 뺀다", insane.rows[0].skipped, true);
+check("수량 0", insane.rows[0].refQty, 0);
 check("출처는 조사", insane.rows[0].priceSource, "research");
-check("제외 사유 기록", insane.excluded[0]?.includes("30%"), true);
+check("제외 사유 기록", insane.excluded[0], "446720 실시간가가 조사가와 30% 넘게 차이 — 이번 회차 제외");
 // 경계 바로 안쪽(+30%)은 그대로 쓴다
 const edge = applyRealtimePrices(
   base,
@@ -577,53 +799,80 @@ check("정규화 잔액: 비활성은 0", activeBalances(dustBalances, dustActiv
   asset_growth: 500_000,
   high_div: 0,
 });
-check("정규화 보유: 활성만", activeHoldings(dustHoldings, dustActive), [
-  { category: "asset_growth", ticker: "379800", qty: 5 },
-]);
-const dustSwitch = {
+const dustPicks = {
   picks: [
-    { category: "배당성장", action: "switch", ticker: "402970", etf_name: "A", ref_price: 12_000, ref_qty: 12, sell_ticker: "446720", sell_qty: 10, sell_ref_price: 14_000, rationale: "", source_doc_ids: [], source_urls: [] },
+    { category: "배당성장", action: "buy", ticker: "402970", etf_name: "A", ref_price: 8_000, ref_qty: 1, rationale: "", source_doc_ids: [], source_urls: [] },
     { category: "자산성장", action: "buy", ticker: "379800", etf_name: "KODEX 미국S&P500", ref_price: 22_000, ref_qty: 22, rationale: "", source_doc_ids: [], source_urls: [] },
   ],
 };
-const dustNorm = normalizePicks(dustSwitch, {
+const dustNorm = normalizePicks(dustPicks, {
   balances: activeBalances(dustBalances, dustActive),
   injectedDocIds: [],
-  holdings: activeHoldings(dustHoldings, dustActive),
   active: dustActive,
 });
-check("배당성장 switch pick 은 건너뜀", dustNorm.rows[0].skipped, true);
-check("  매도 없음", dustNorm.rows[0].sellTicker, null);
+check("배당성장 pick 은 건너뜀", dustNorm.rows[0].skipped, true);
 check("  수량 0", dustNorm.rows[0].refQty, 0);
 check(
   "  사유: 매수 대상이 아닌 카테고리",
-  dustNorm.dropped.some((d) => d.startsWith("이번 회차 매수 대상이 아닌 카테고리라 갈아타기를 적용하지 않음")),
+  dustNorm.dropped.some((d) => d.startsWith("이번 회차 매수 대상이 아닌 카테고리라 매수하지 않음")),
   true,
 );
-check("자산성장 매수는 그대로: floor(500000/22000)", dustNorm.rows[1].refQty, 22);
-// 방어 층을 하나씩만 남겨도 막혀야 한다 — active 를 빼고 잔액 0·보유 필터만으로
-const dustNoActive = normalizePicks(dustSwitch, {
+check("자산성장 매수는 자리 몫 floor(250000/22000)", dustNorm.rows[1].refQty, 11);
+// 방어 층을 하나씩만 남겨도 막혀야 한다
+const dustNoActive = normalizePicks(dustPicks, {
   balances: activeBalances(dustBalances, dustActive),
   injectedDocIds: [],
-  holdings: activeHoldings(dustHoldings, dustActive),
 });
-check("active 없이도 잔액 0·보유 필터로 건너뜀", dustNoActive.rows[0].skipped, true);
-const dustActiveOnly = normalizePicks(dustSwitch, {
+check("active 없이도 잔액 0으로 건너뜀", dustNoActive.rows[0].skipped, true);
+const dustActiveOnly = normalizePicks(dustPicks, {
   balances: dustBalances,
   injectedDocIds: [],
-  holdings: dustHoldings,
   active: dustActive,
 });
-check("잔액·보유를 그대로 넘겨도 active 로 건너뜀", dustActiveOnly.rows[0].skipped, true);
-const dustUnguarded = normalizePicks(dustSwitch, {
+check("잔액을 그대로 넘겨도 active 로 건너뜀", dustActiveOnly.rows[0].skipped, true);
+const dustUnguarded = normalizePicks(dustPicks, {
   balances: dustBalances,
   injectedDocIds: [],
-  holdings: dustHoldings,
 });
 check(
-  "대조군: 세 겹을 다 빼면 잔돈+매도대금으로 갈아타기가 성립",
-  [dustUnguarded.rows[0].skipped, dustUnguarded.rows[0].sellTicker],
-  [false, "446720"],
+  "대조군: 두 겹을 다 빼면 잔돈 8,335원으로 1주 매수가 성립",
+  [dustUnguarded.rows[0].skipped, dustUnguarded.rows[0].refQty],
+  [false, 1],
+);
+
+console.log("\n=== ③은 갈아타기를 쓰지 않는다: action=switch 는 매수로 강등 ===");
+const legacySwitch = normalizePicks(
+  {
+    picks: [
+      { category: "고배당", action: "switch", ticker: "490600", etf_name: "C", ref_price: 10_000, ref_qty: 0, sell_ticker: "251350", sell_qty: 10, sell_ref_price: 14_000, rationale: "", source_doc_ids: [], source_urls: [] },
+    ],
+  },
+  ctx,
+);
+check("1행", legacySwitch.rows.length, 1);
+check("매수로 처리(건너뜀 아님)", legacySwitch.rows[0].skipped, false);
+check("매도 다리 없음", [legacySwitch.rows[0].sellTicker, legacySwitch.rows[0].sellQty, legacySwitch.rows[0].sellRefPrice], [null, null, null]);
+check("매도 조사가도 없음", legacySwitch.rows[0].sellResearchPrice, null);
+check("수량은 배정액만으로 floor(140000/10000)", legacySwitch.rows[0].refQty, 14);
+check(
+  "사유 기록",
+  legacySwitch.dropped,
+  ["③은 갈아타기를 쓰지 않음 — 매수로 처리: 490600"],
+);
+check(
+  "대조군: 같은 pick 을 action=buy 로 내면 사유 없이 같은 결과",
+  (() => {
+    const asBuy = normalizePicks(
+      {
+        picks: [
+          { category: "고배당", action: "buy", ticker: "490600", etf_name: "C", ref_price: 10_000, ref_qty: 0, rationale: "", source_doc_ids: [], source_urls: [] },
+        ],
+      },
+      ctx,
+    );
+    return [asBuy.rows[0].refQty, asBuy.dropped.length];
+  })(),
+  [14, 0],
 );
 
 console.log("\n=== 고배당 건너뜀 재배분이 비활성 카테고리로 흐르지 않는다 ===");
@@ -660,10 +909,11 @@ check(
   [false, 100_000, 9],
 );
 
-console.log("\n=== ③ 출력 규칙: 세 개 활성이면 HEAD 원문과 한 글자도 다르지 않다 ===");
-// git show HEAD:web/src/server/orchestrator.ts 의 [출력 규칙] 10줄 원문
-const HEAD_OUTPUT_RULES = [
-  "- 세 카테고리(배당성장·자산성장·고배당) 각각 정확히 한 번씩, 총 3개를 picks에 담아라.",
+console.log("\n=== ③ 출력 규칙 v3: 갈아타기 3줄이 빠지고 기준가가 실시간 시세로 바뀐다 ===");
+// 직전 판(자리 도입 시점, 커밋 9b2b83d)의 꼬리 9줄 원문 — 무엇이 사라졌는지 이 배열로 대조한다.
+// 그 커밋의 recommendOutputRules 에서 그대로 복사한 스냅샷이며, HEAD 가 앞으로 가도
+// 이 문자열은 고정이다(git show 로 매번 읽으면 HEAD 가 바뀔 때마다 검사가 깨진다).
+const PREV_TAIL_RULES = [
   "- 매수면 action=\"buy\", 건너뜀이면 action=\"skip\", 보유 종목을 팔고 다른 종목으로 교체하는 게 낫다고 판단되면 action=\"switch\".",
   "- action=skip이면 ticker·etf_name·ref_price는 null, ref_qty는 0으로 둔다. 값을 지어내지 마라.",
   "- action=switch이면 sell_ticker=팔 보유 종목 코드, sell_qty=팔 수량(위 보유 현황의 수량 이내), sell_ref_price=그 종목의 조사 가격. ticker·etf_name·ref_price에는 새로 살 종목을 적는다. 갈아타기의 근거(왜 파는지, 왜 그 종목으로 가는지)를 rationale에 조사 수치를 인용해 설명하라.",
@@ -674,42 +924,202 @@ const HEAD_OUTPUT_RULES = [
   "- source_doc_ids에는 위에 표시된 research_doc_id 중 실제로 근거로 쓴 것만 넣어라.",
   "- JSON 밖에는 아무것도 출력하지 마라.",
 ];
+// v3 꼬리 6줄: action 줄이 교체되고, 갈아타기 3줄이 사라지고,
+// ref_price·ref_qty 두 줄이 실시간 시세 기준으로 바뀌었다.
+const TAIL_RULES = [
+  "- action은 buy 또는 skip만 쓴다. 기존 보유분 매도·교체는 이 단계에서 제안하지 않는다(매도·교체 검토는 ④, 중복 보유 정리는 ⑤).",
+  "- action=skip이면 ticker·etf_name·ref_price는 null, ref_qty는 0으로 둔다. 값을 지어내지 마라.",
+  "- ref_price는 [실시간 시세]의 값만 쓴다. 실시간가가 없는 종목은 이번 회차 후보에서 제외한다 — ② 문서의 price로 대체하지 마라.",
+  "- ref_qty: floor(budget_krw ÷ ref_price).",
+  "- source_doc_ids에는 위에 표시된 research_doc_id 중 실제로 근거로 쓴 것만 넣어라.",
+  "- JSON 밖에는 아무것도 출력하지 마라.",
+];
 const ALL: Category[] = ["div_growth", "asset_growth", "high_div"];
-check("대조군: 세 개 활성 = HEAD 10줄", recommendOutputRules(ALL, false), HEAD_OUTPUT_RULES);
-const rulesAsset = recommendOutputRules(["asset_growth"], true);
+const ROLE_RULES = [
+  '- 자산성장만은 예외다. 공격적 성장 자리(role="aggressive", 변동이 크더라도 장기 기대 수익이 높은 성장 지수)와 안정적 성장 자리(role="stable", 여러 업종에 분산하여 특정 업종·종목 의존도를 낮추는 주식 지수)에 ETF를 하나씩 골라 자산성장 pick 2개를 담아라. 두 자리에 같은 종목이나 같은 기초지수를 넣지 마라.',
+  '- role은 자산성장 pick에만 "aggressive" 또는 "stable"로 적고 다른 카테고리 pick은 null로 둔다. 자리 비중과 자리별 budget_krw는 시스템이 자산성장 잔액을 나눠 채우므로 직접 계산하지 마라. 두 자리에 같은 종목을 넣으면 공격적 성장 자리만 남고 안정적 성장 자리는 비운다. 건너뛴 자리의 몫은 자산성장 잔액으로 이월되어 다음 회차에 다시 자리 비중대로 나뉜다. 다른 카테고리로는 가지 않는다.',
+];
 check(
-  "자산성장만",
+  "세 개 활성: 개수 줄 + 자리 2줄 + 꼬리 6줄",
+  recommendOutputRules(ALL),
+  [
+    "- 배당성장·고배당은 각각 정확히 한 번씩 picks에 담고, 자산성장은 아래 자리 규칙을 따른다.",
+    ...ROLE_RULES,
+    ...TAIL_RULES,
+  ],
+);
+check(
+  "대조군: 직전 판의 갈아타기 4줄이 전부 사라졌다",
+  recommendOutputRules(ALL).filter((l) =>
+    [PREV_TAIL_RULES[0], PREV_TAIL_RULES[2], PREV_TAIL_RULES[3], PREV_TAIL_RULES[4]].includes(l),
+  ),
+  [],
+);
+// 활성 조합은 공집합을 뺀 7가지뿐이다 — 하나도 빠뜨리지 않고 전부 본다
+const COMBOS: Category[][] = [1, 2, 3, 4, 5, 6, 7].map((mask) =>
+  ALL.filter((_, i) => (mask >> i) & 1),
+);
+check("전수 검사 대상은 활성 조합 7가지", COMBOS.length, 7);
+check(
+  "대조군: 활성 조합 7가지 어디에도 'switch' 라는 낱말이 없다",
+  COMBOS.flatMap((a) => recommendOutputRules(a)).filter(
+    (l) => l.includes("switch") || l.includes("갈아타기"),
+  ),
+  [],
+);
+check(
+  "대조군: 바뀌지 않은 꼬리 3줄은 직전 판 원문 그대로",
+  [TAIL_RULES[1], TAIL_RULES[4], TAIL_RULES[5]],
+  [PREV_TAIL_RULES[1], PREV_TAIL_RULES[7], PREV_TAIL_RULES[8]],
+);
+check(
+  "자산성장이 비활성이면 개수 줄은 직전 판 원문 그대로",
+  recommendOutputRules(["div_growth", "high_div"]),
+  [
+    "- 이번 회차 활성 카테고리는 배당성장·고배당뿐이다. 배당성장·고배당 각각 정확히 한 번씩, 총 2개를 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.",
+    ...TAIL_RULES,
+  ],
+);
+check(
+  "대조군: 자산성장이 비활성이면 자리 줄이 붙지 않는다",
+  recommendOutputRules(["div_growth"]).some((l) => ROLE_RULES.includes(l)),
+  false,
+);
+check(
+  "대조군: 배당성장만 활성이면 개수 줄도 직전 판 그대로",
+  recommendOutputRules(["div_growth"])[0],
+  "- 이번 회차 활성 카테고리는 배당성장뿐이다. 배당성장 한 개만 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.",
+);
+const rulesAsset = recommendOutputRules(["asset_growth"]);
+check(
+  "자산성장만: 개수는 자리 규칙에 맡긴다",
   rulesAsset[0],
-  "- 이번 회차 활성 카테고리는 자산성장뿐이다. 자산성장 한 개만 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.",
+  "- 이번 회차 활성 카테고리는 자산성장뿐이다. 자산성장만 picks에 담고, 몇 개를 담을지는 아래 자리 규칙을 따른다. 다른 카테고리는 이번 회차에 매수하지 않는다.",
 );
 check(
-  "비활성 보유가 있으면 갈아타기 제외 문구",
-  rulesAsset[5],
-  `${HEAD_OUTPUT_RULES[5]} (이번 회차 매수 대상 아님) 표시가 붙은 종목은 팔거나 갈아타지 않는다.`,
+  "  개수 줄이 자리 줄과 모순되지 않는다(‘한 개만’ 문구 없음)",
+  rulesAsset[0].includes("한 개만"),
+  false,
 );
-check("  나머지 8줄은 HEAD 그대로", [...rulesAsset.slice(1, 5), ...rulesAsset.slice(6)], [...HEAD_OUTPUT_RULES.slice(1, 5), ...HEAD_OUTPUT_RULES.slice(6)]);
+check("  자리 2줄이 바로 뒤에", rulesAsset.slice(1, 3), ROLE_RULES);
+check("  꼬리 6줄", rulesAsset.slice(3), TAIL_RULES);
 check(
-  "대조군: 비활성 보유가 없으면 갈아타기 문구 그대로",
-  recommendOutputRules(["asset_growth"], false)[5],
-  HEAD_OUTPUT_RULES[5],
-);
-check(
-  "두 개 활성",
-  recommendOutputRules(["div_growth", "asset_growth"], false)[0],
-  "- 이번 회차 활성 카테고리는 배당성장·자산성장뿐이다. 배당성장·자산성장 각각 정확히 한 번씩, 총 2개를 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.",
+  "두 개 활성(자산성장 포함)",
+  recommendOutputRules(["div_growth", "asset_growth"])[0],
+  "- 이번 회차 활성 카테고리는 배당성장·자산성장뿐이다. 배당성장은 정확히 한 번씩 picks에 담고, 자산성장은 아래 자리 규칙을 따른다. 다른 카테고리는 이번 회차에 매수하지 않는다.",
 );
 check(
-  "대조군: 세 개 활성이면 잔액·보유 줄도 HEAD 형식 그대로(표시 없음)",
+  "대조군: 세 개 활성이면 잔액·보유 줄도 이전 형식 그대로(표시 없음)",
   [budgetLine("high_div", 140_000, ALL), holdingLine(dustHoldings[0], ALL)],
   ["- 고배당: 140,000원", "- 배당성장 | 446720 SOL 미국배당다우존스 | 10주 | 평단가 13,500원"],
 );
 check(
-  "대조군: 세 개 활성이면 정규화 잔액·보유도 그대로",
-  [activeBalances(balances, ALL), activeHoldings(dustHoldings, ALL).length],
-  [balances, 2],
+  "대조군: 세 개 활성이면 정규화 잔액도 그대로",
+  activeBalances(balances, ALL),
+  balances,
 );
 
-console.log("\n=== 자산성장만 출력해도 정규화는 자산성장 1행, 잔액 전액 배정 ===");
+console.log("\n=== 자리별 배정액 줄 (③ 잔액 줄 아래) ===");
+check(
+  "50:50",
+  roleBudgetLine(500_000, { aggressive: 0.5, stable: 0.5 }),
+  "  · 공격적 성장 자리 50%: 250,000원 / 안정적 성장 자리 50%: 250,000원",
+);
+check(
+  "40:60",
+  roleBudgetLine(500_000, { aggressive: 0.4, stable: 0.6 }),
+  "  · 공격적 성장 자리 40%: 200,000원 / 안정적 성장 자리 60%: 300,000원",
+);
+check(
+  "비중을 안 주면 기본 50:50",
+  roleBudgetLine(8_335),
+  "  · 공격적 성장 자리 50%: 4,167원 / 안정적 성장 자리 50%: 4,167원",
+);
+check(
+  "정규화가 쓰는 식과 같다",
+  [seatBudget(500_000, 0.4), seatBudget(500_000, 0.6)],
+  [200_000, 300_000],
+);
+check("대조군: 부동소수 오차(0.7×700,000)를 걷어낸다", seatBudget(700_000, 0.7), 490_000);
+check("  나머지 자리 몫", seatBudget(700_000, 0.3), 210_000);
+check("  두 몫의 합이 잔액", seatBudget(700_000, 0.7) + seatBudget(700_000, 0.3), 700_000);
+check("  대조군: 보정 없는 floor 는 1원을 흘린다", Math.floor(700_000 * 0.7), 489_999);
+check("진짜 소수 몫은 내림", seatBudget(8_335, 0.5), 4_167);
+
+console.log("\n=== ③ 입력의 실시간 시세 블록 ===");
+const liveAt = new Date("2026-09-21T14:23:00+09:00");
+check(
+  "있는 값과 없는 값 — 종목마다 체결 시각을 병기한다",
+  realtimePriceBlock(
+    ["446720", "133690"],
+    new Map([["446720", { price: 14_110, pricedAt: liveAt, marketStatus: "OPEN" }]]),
+  ),
+  "[실시간 시세 — 14:23 KST 기준, 장중, 매수 가능 여부와 ref_qty는 이 값으로 판단]\n- 446720: 14,110원 (14:23)\n- 133690: 실시간가 없음",
+);
+check(
+  "장이 닫혔으면 머리줄이 종가라고 말한다",
+  realtimePriceBlock(
+    ["446720"],
+    new Map([["446720", { price: 14_110, pricedAt: liveAt, marketStatus: "CLOSE" }]]),
+  ).split("\n")[0],
+  "[실시간 시세 — 14:23 KST 기준, 장 마감 후 종가, 매수 가능 여부와 ref_qty는 이 값으로 판단]",
+);
+check(
+  "대조군: 하나라도 장중이 아니면 장중이라고 하지 않는다",
+  realtimePriceBlock(
+    ["446720", "133690"],
+    new Map([
+      ["446720", { price: 14_110, pricedAt: liveAt, marketStatus: "OPEN" }],
+      ["133690", { price: 21_000, pricedAt: liveAt, marketStatus: "CLOSE" }],
+    ]),
+  ).split("\n")[0].includes("장 마감 후 종가"),
+  true,
+);
+check(
+  "장 상태를 모르면 모른다고 적는다",
+  realtimePriceBlock(
+    ["446720"],
+    new Map([["446720", { price: 14_110, pricedAt: liveAt }]]),
+  ).split("\n")[0].includes("장 마감 후 종가"),
+  true,
+);
+check(
+  "대조군: 하나도 못 받으면 전부 '실시간가 없음'",
+  realtimePriceBlock(["446720"], new Map(), liveAt).split("\n")[1],
+  "- 446720: 실시간가 없음",
+);
+check(
+  "  머리줄 시각은 조회 시각으로 떨어지고 장 상태는 확인 불가",
+  realtimePriceBlock(["446720"], new Map(), liveAt).split("\n")[0],
+  "[실시간 시세 — 14:23 KST 기준, 장 상태 확인 불가, 매수 가능 여부와 ref_qty는 이 값으로 판단]",
+);
+check(
+  "UTC 로 들어온 기준 시각도 KST 로 적는다",
+  realtimePriceBlock(
+    ["446720"],
+    new Map([
+      ["446720", { price: 14_110, pricedAt: new Date("2026-09-21T05:23:00Z"), marketStatus: "OPEN" }],
+    ]),
+  ).split("\n")[0],
+  "[실시간 시세 — 14:23 KST 기준, 장중, 매수 가능 여부와 ref_qty는 이 값으로 판단]",
+);
+check(
+  "  종목 줄의 시각도 KST",
+  realtimePriceBlock(
+    ["446720"],
+    new Map([
+      ["446720", { price: 14_110, pricedAt: new Date("2026-09-21T05:23:00Z"), marketStatus: "OPEN" }],
+    ]),
+  ).split("\n")[1],
+  "- 446720: 14,110원 (14:23)",
+);
+check(
+  "조회 대상이 없으면 빈 줄 대신 안내",
+  realtimePriceBlock([], new Map(), liveAt).split("\n")[1],
+  "- (조회 대상 종목 없음)",
+);
+
+console.log("\n=== 자산성장 pick이 하나면 자리 하나만 차고 그 자리 몫만 배정된다 ===");
 const assetBalances = { div_growth: 0, asset_growth: 500_000, high_div: 0 };
 const assetPick = normalizePicks(
   {
@@ -721,12 +1131,22 @@ const assetPick = normalizePicks(
 );
 check("1행", assetPick.rows.length, 1);
 check("자산성장", assetPick.rows[0].category, "asset_growth");
-check("잔액 전액 배정", assetPick.rows[0].budgetKrw, 500_000);
-check("수량 floor(500000/22000)", assetPick.rows[0].refQty, 22);
-check("버린 것 없음", assetPick.dropped.length, 0);
+check("자리 몫만 배정 floor(500000×0.5)", assetPick.rows[0].budgetKrw, 250_000);
+check("수량 floor(250000/22000)", assetPick.rows[0].refQty, 11);
+check(
+  "사유 2건(자리 자동 배정 + 빈 자리 이월)",
+  assetPick.dropped,
+  [
+    "자산성장 pick에 role이 없어 공격적 성장 자리로 배정 — 379800",
+    "자산성장 자리 1개가 비어 그 몫은 자산성장 잔액으로 이월",
+  ],
+);
 
 console.log("\n=== 형식 지시문: 세 개 활성이면 HEAD 원문 스냅샷과 같다 ===");
 // git show HEAD:web/src/domain/docFormat.ts 의 buildFormatInstruction 을 아래 인자로 돌린 출력
+// 활성 카테고리를 지정해도 소제목·예시 행 말고는 바뀌지 않는다는 것을 보는 대조군 스냅샷.
+// 기준은 커밋 9b2b83d + 이번 회차에 고친 total_return_1y·nav_trend 정의 2줄이며,
+// 여기 문자열은 고정이다(빌드 시점 HEAD 를 읽어 오면 HEAD 가 바뀔 때마다 검사가 깨진다).
 const HEAD_FORMAT_ONDEMAND = `
 ────────────────────────────────
 [출력 형식 — 반드시 지킬 것]
@@ -765,8 +1185,11 @@ model: (사용한 모델명)
 - ticker는 앞의 0을 보존한 6자리 문자열.
 - price는 원 단위 정수만 (쉼표·"원" 금지). 나머지 비율은 % 기호 없는 숫자만.
 - category는 배당성장 / 자산성장 / 고배당 중 하나.
-- **total_return_1y**: 최근 1년 총투자수익률(기준가격 변동 + 분배금). 분배율과 나란히 비교하기 위한 값이다.
-- **nav_trend**: 최근 6~12개월 NAV 방향을 up / flat / down 중 하나로. 확인 불가면 NA.
+- **total_return_1y**: 최근 12개월, NAV 기준, 분배금 재투자 가정 총수익률. 운용사·거래소 공시값을 우선 쓰고,
+  공시값이 없으면 계산 근거를 note에 적어라. 시장가 기준이거나 분배금을 현금으로 합산한 방식이면 note에 명시한다.
+  분배율과 나란히 비교하기 위한 값이다.
+- **nav_trend**: 최근 12개월 NAV 방향을 up / flat / down 중 하나로. 기간은 12개월로 고정이며,
+  6개월만 관찰한 경우에는 그 사실을 note에 적어라. 확인 불가면 NA.
 - **yield_basis**: 그 분배율이 어떤 기준으로 산출된 값인지.
   trailing12m(후행 12개월 실지급) / annualized_1m(직전월 연율화) / target(목표분배율) / unknown 중 하나.
   기준이 다르면 종목 간 분배율 비교가 성립하지 않으므로 반드시 확인해서 적어라.
@@ -818,6 +1241,356 @@ check(
     ) === HEAD_FORMAT_ONDEMAND,
   true,
 );
+
+// ── 자산성장 두 자리(공격·안정) 나눠 담기 ──────────────────
+// 금액·종목은 전부 합성 값이다 (실제 잔액·보유가 아님).
+
+console.log("\n=== 자산성장 두 자리: 잔액을 50:50으로 나눠 배정 ===");
+const seatBalances: Record<Category, number> = {
+  div_growth: 0,
+  asset_growth: 500_000,
+  high_div: 0,
+};
+const seatCtx = {
+  balances: seatBalances,
+  injectedDocIds: [],
+  active: ["asset_growth"] as Category[],
+};
+const pick = (over: Record<string, unknown>) => ({
+  category: "자산성장",
+  action: "buy",
+  etf_name: "합성 ETF",
+  ref_qty: 0,
+  rationale: "",
+  source_doc_ids: [],
+  source_urls: [],
+  ...over,
+});
+
+const twoSeats = normalizePicks(
+  {
+    picks: [
+      pick({ role: "aggressive", ticker: "133690", ref_price: 21_000 }),
+      pick({ role: "stable", ticker: "379800", ref_price: 22_000 }),
+    ],
+  },
+  seatCtx,
+);
+check("2행", twoSeats.rows.length, 2);
+check("버린 것 없음", twoSeats.dropped.length, 0);
+check("자리 기록", twoSeats.rows.map((r) => r.role), ["aggressive", "stable"]);
+check("비중 기록", twoSeats.rows.map((r) => r.weight), [0.5, 0.5]);
+check("공격 배정 floor(500000×0.5)", twoSeats.rows[0].budgetKrw, 250_000);
+check("안정 배정 floor(500000×0.5)", twoSeats.rows[1].budgetKrw, 250_000);
+check("공격 수량 floor(250000/21000)", twoSeats.rows[0].refQty, 11);
+check("안정 수량 floor(250000/22000)", twoSeats.rows[1].refQty, 11);
+check("배정 합계 = 잔액", twoSeats.rows.reduce((a, r) => a + r.budgetKrw, 0), 500_000);
+const twoSeatsSpend = twoSeats.rows.reduce(
+  (a, r) => a + r.refQty * (r.refPrice ?? 0),
+  0,
+);
+check("매수 합계가 잔액 이내", twoSeatsSpend <= seatBalances.asset_growth, true);
+check("  합계", twoSeatsSpend, 11 * 21_000 + 11 * 22_000);
+
+console.log("\n=== 대조군: 나누지 않고 옛 방식(두 pick 모두 잔액 전액)이면 합계가 잔액을 넘는다 ===");
+// 카테고리당 1종목 전제였던 HEAD는 같은 카테고리 pick마다 budgets[category]를 그대로 줬다.
+const oldWayQty = [
+  computeRefQty(seatBalances.asset_growth, 0, 21_000),
+  computeRefQty(seatBalances.asset_growth, 0, 22_000),
+];
+const oldWaySpend = oldWayQty[0] * 21_000 + oldWayQty[1] * 22_000;
+check("옛 방식 수량", oldWayQty, [23, 22]);
+check("옛 방식 합계가 잔액 초과", oldWaySpend > seatBalances.asset_growth, true);
+check("  초과분", oldWaySpend - seatBalances.asset_growth, 467_000);
+check("나눈 쪽은 초과하지 않는다", twoSeatsSpend > seatBalances.asset_growth, false);
+
+console.log("\n=== 자리 비중은 설정값을 따른다 (40:60) ===");
+const skewed = normalizePicks(
+  {
+    picks: [
+      pick({ role: "aggressive", ticker: "133690", ref_price: 21_000 }),
+      pick({ role: "stable", ticker: "379800", ref_price: 22_000 }),
+    ],
+  },
+  { ...seatCtx, roleWeights: { aggressive: 0.4, stable: 0.6 } },
+);
+check("공격 배정 floor(500000×0.4)", skewed.rows[0].budgetKrw, 200_000);
+check("안정 배정 floor(500000×0.6)", skewed.rows[1].budgetKrw, 300_000);
+check("공격 수량 floor(200000/21000)", skewed.rows[0].refQty, 9);
+check("안정 수량 floor(300000/22000)", skewed.rows[1].refQty, 13);
+check(
+  "합계가 잔액 이내",
+  skewed.rows.reduce((a, r) => a + r.refQty * (r.refPrice ?? 0), 0) <= 500_000,
+  true,
+);
+
+console.log("\n=== 깨진 자리 비중은 기본 50:50으로 되돌린다 ===");
+check("정상값 통과", normalizeRoleWeights({ aggressive: 0.4, stable: 0.6 }), { aggressive: 0.4, stable: 0.6 });
+check("합 1.00 정규화", normalizeRoleWeights({ aggressive: 0.495, stable: 0.495 }), { aggressive: 0.5, stable: 0.5 });
+check("합이 크게 어긋나면 기본값", normalizeRoleWeights({ aggressive: 0.9, stable: 0.9 }), { aggressive: 0.5, stable: 0.5 });
+check("0은 자리가 아니다 → 기본값", normalizeRoleWeights({ aggressive: 0, stable: 1 }), { aggressive: 0.5, stable: 0.5 });
+check("값이 없으면 기본값", normalizeRoleWeights(null), { aggressive: 0.5, stable: 0.5 });
+check("숫자가 아니면 기본값", normalizeRoleWeights({ aggressive: "반", stable: "반" }), { aggressive: 0.5, stable: 0.5 });
+
+console.log("\n=== 두 자리에 같은 종목을 내면 낸 순서와 무관하게 공격적 성장 자리만 남는다 ===");
+const sameTicker = normalizePicks(
+  {
+    picks: [
+      pick({ role: "aggressive", ticker: "133690", ref_price: 22_000 }),
+      pick({ role: "stable", ticker: "133690", ref_price: 22_000 }),
+    ],
+  },
+  seatCtx,
+);
+check("1행", sameTicker.rows.length, 1);
+check("공격적 성장 자리만 앉는다", sameTicker.rows[0].role, "aggressive");
+check("자리 몫만 배정", sameTicker.rows[0].budgetKrw, 250_000);
+check("비중도 자리 비중", sameTicker.rows[0].weight, 0.5);
+check("수량 floor(250000/22000)", sameTicker.rows[0].refQty, 11);
+check(
+  "사유 기록",
+  sameTicker.dropped.some((d) => d.includes("안정적 성장 자리 비움")),
+  true,
+);
+check(
+  "빈 자리 몫 이월 사유도 남는다",
+  sameTicker.dropped.some((d) => d.includes("자리 1개가 비어")),
+  true,
+);
+// 대조군: stable 을 먼저 내도 결과가 같아야 한다 — 코드는 GROWTH_ROLES 순서로 고르지
+// 모델이 낸 순서로 고르지 않는다. 비중을 70:30으로 벌려 어느 자리 몫인지 눈에 보이게 한다.
+const sameTickerStableFirst = normalizePicks(
+  {
+    picks: [
+      pick({ role: "stable", ticker: "133690", ref_price: 22_000 }),
+      pick({ role: "aggressive", ticker: "133690", ref_price: 22_000 }),
+    ],
+  },
+  { ...seatCtx, roleWeights: { aggressive: 0.7, stable: 0.3 } },
+);
+check("대조군(stable 먼저): 1행", sameTickerStableFirst.rows.length, 1);
+check(
+  "  남는 자리는 여전히 공격적 성장",
+  sameTickerStableFirst.rows[0].role,
+  "aggressive",
+);
+check(
+  "  배정도 공격 자리 몫 floor(500000×0.7)",
+  [sameTickerStableFirst.rows[0].budgetKrw, sameTickerStableFirst.rows[0].weight],
+  [350_000, 0.7],
+);
+check(
+  "  사유도 안정적 성장 자리 비움",
+  sameTickerStableFirst.dropped.some((d) => d.includes("안정적 성장 자리 비움")),
+  true,
+);
+check(
+  "  대조군의 대조군: 종목이 다르면 두 자리가 다 찬다 (350,000 / 150,000)",
+  normalizePicks(
+    {
+      picks: [
+        pick({ role: "stable", ticker: "379800", ref_price: 22_000 }),
+        pick({ role: "aggressive", ticker: "133690", ref_price: 22_000 }),
+      ],
+    },
+    { ...seatCtx, roleWeights: { aggressive: 0.7, stable: 0.3 } },
+  ).rows.map((r) => [r.role, r.budgetKrw]),
+  // 행 순서는 모델이 낸 순서 그대로다 — 자리 선택만 GROWTH_ROLES 순서를 따른다
+  [
+    ["stable", 150_000],
+    ["aggressive", 350_000],
+  ],
+);
+
+console.log("\n=== 한 자리를 건너뛰면 그 자리 몫만 이월된다 (다른 자리로 넘기지 않는다) ===");
+const oneSeatSkipped = normalizePicks(
+  {
+    picks: [
+      pick({ role: "aggressive", action: "skip", ticker: null, etf_name: null, ref_price: null, rationale: "후보 없음" }),
+      pick({ role: "stable", ticker: "379800", ref_price: 22_000 }),
+    ],
+  },
+  seatCtx,
+);
+check("2행", oneSeatSkipped.rows.length, 2);
+check("공격 자리 건너뜀", oneSeatSkipped.rows[0].skipped, true);
+check("  이월액은 그 자리 몫뿐", oneSeatSkipped.rows[0].budgetKrw, 250_000);
+check("안정 자리 배정은 그대로 반쪽", oneSeatSkipped.rows[1].budgetKrw, 250_000);
+check("  수량 floor(250000/22000)", oneSeatSkipped.rows[1].refQty, 11);
+check(
+  "대조군: 건너뛴 자리 몫이 넘어갔다면 수량이 22주가 된다",
+  computeRefQty(500_000, 0, 22_000),
+  22,
+);
+
+console.log("\n=== role을 안 적으면 남은 자리에 순서대로 앉힌다 ===");
+const noRole = normalizePicks(
+  {
+    picks: [
+      pick({ ticker: "133690", ref_price: 21_000 }),
+      pick({ ticker: "379800", ref_price: 22_000 }),
+    ],
+  },
+  seatCtx,
+);
+check("자리 배정", noRole.rows.map((r) => r.role), ["aggressive", "stable"]);
+check("비중 50:50", noRole.rows.map((r) => r.weight), [0.5, 0.5]);
+check("사유 2건", noRole.dropped.filter((d) => d.includes("role이 없어")).length, 2);
+check("대조군: pick이 하나뿐이면 role이 없어도 남은 자리에 앉힌다", assetPick.rows[0].role, "aggressive");
+check("  그 pick도 그 자리 몫만 받는다", assetPick.rows[0].budgetKrw, 250_000);
+check("  비중도 기록", assetPick.rows[0].weight, 0.5);
+
+console.log("\n=== 같은 자리에 pick이 둘이면 먼저 나온 것만 쓴다 ===");
+const dupRole = normalizePicks(
+  {
+    picks: [
+      pick({ role: "aggressive", ticker: "133690", ref_price: 21_000 }),
+      pick({ role: "aggressive", ticker: "379800", ref_price: 22_000 }),
+    ],
+  },
+  seatCtx,
+);
+check("1행", dupRole.rows.length, 1);
+check("먼저 나온 종목", dupRole.rows[0].ticker, "133690");
+check("자리가 하나 비어도 앉은 자리 몫만", dupRole.rows[0].budgetKrw, 250_000);
+check(
+  "사유 기록",
+  dupRole.dropped.some((d) => d.includes("공격적 성장 자리에 pick이 둘")),
+  true,
+);
+check(
+  "  빈 자리 몫은 이월",
+  dupRole.dropped.some(
+    (d) => d === "자산성장 자리 1개가 비어 그 몫은 자산성장 잔액으로 이월",
+  ),
+  true,
+);
+
+console.log("\n=== 자리보다 많이 내면 나머지는 버린다 ===");
+const threePicks = normalizePicks(
+  {
+    picks: [
+      pick({ role: "aggressive", ticker: "133690", ref_price: 21_000 }),
+      pick({ role: "stable", ticker: "379800", ref_price: 22_000 }),
+      pick({ ticker: "360750", ref_price: 26_000 }),
+    ],
+  },
+  seatCtx,
+);
+check("2행", threePicks.rows.length, 2);
+check("남은 종목", threePicks.rows.map((r) => r.ticker), ["133690", "379800"]);
+check(
+  "사유 기록",
+  threePicks.dropped.some((d) => d.includes("자리 2개가 이미 차서 제외")),
+  true,
+);
+check(
+  "배정 합계가 잔액 이내",
+  threePicks.rows.reduce((a, r) => a + r.budgetKrw, 0) <= 500_000,
+  true,
+);
+
+console.log("\n=== 한 자리 pick을 생략해도 남은 자리가 전액을 먹지 않는다 ===");
+// 모델이 stable pick 자체를 빼먹는 경우. action=skip 으로 보낼 때와 같은 몫이어야 한다.
+const seatOmitted = normalizePicks(
+  { picks: [pick({ role: "aggressive", ticker: "133690", ref_price: 21_000 })] },
+  seatCtx,
+);
+check("1행", seatOmitted.rows.length, 1);
+check("공격 자리 몫만 배정", seatOmitted.rows[0].budgetKrw, 250_000);
+check("비중 기록", seatOmitted.rows[0].weight, 0.5);
+check("수량 floor(250000/21000)", seatOmitted.rows[0].refQty, 11);
+check(
+  "빈 자리 몫은 이월 사유로 남는다",
+  seatOmitted.dropped,
+  ["자산성장 자리 1개가 비어 그 몫은 자산성장 잔액으로 이월"],
+);
+check(
+  "대조군: 같은 자리를 action=skip 으로 보내도 배정액이 같다",
+  normalizePicks(
+    {
+      picks: [
+        pick({ role: "aggressive", ticker: "133690", ref_price: 21_000 }),
+        pick({ role: "stable", action: "skip", ticker: null, etf_name: null, ref_price: null }),
+      ],
+    },
+    seatCtx,
+  ).rows.map((r) => r.budgetKrw),
+  [250_000, 250_000],
+);
+check(
+  "대조군: 전액을 받았다면 수량이 22주가 된다",
+  computeRefQty(500_000, 0, 22_000),
+  22,
+);
+check(
+  "대조군: 두 자리가 같은 종목이어도 전액을 몰아주지 않는다",
+  [sameTicker.rows[0].budgetKrw, sameTicker.rows[0].weight],
+  [250_000, 0.5],
+);
+check(
+  "  다른 자리에 넣었다면 두 자리가 다 찬다",
+  normalizePicks(
+    {
+      picks: [
+        pick({ role: "aggressive", ticker: "133690", ref_price: 22_000 }),
+        pick({ role: "stable", ticker: "379800", ref_price: 22_000 }),
+      ],
+    },
+    seatCtx,
+  ).rows.map((r) => r.budgetKrw),
+  [250_000, 250_000],
+);
+
+console.log("\n=== 나눈 뒤 실시간가로 갈아끼워도 자리 예산을 넘지 않는다 ===");
+const seatPriced = applyRealtimePrices(
+  twoSeats.rows,
+  new Map([
+    ["133690", { price: 18_000, pricedAt }],
+    ["379800", { price: 25_000, pricedAt }],
+  ]),
+);
+check("적용 2/2", [seatPriced.applied, seatPriced.eligible], [2, 2]);
+check("공격 수량 floor(250000/18000)", seatPriced.rows[0].refQty, 13);
+check("안정 수량 floor(250000/25000)", seatPriced.rows[1].refQty, 10);
+check("자리 예산은 그대로", seatPriced.rows.map((r) => r.budgetKrw), [250_000, 250_000]);
+check(
+  "각 자리의 매수액이 그 자리 예산 이내",
+  seatPriced.rows.every((r) => r.refQty * (r.refPrice ?? 0) <= r.budgetKrw),
+  true,
+);
+check(
+  "매수 합계가 잔액 이내",
+  seatPriced.rows.reduce((a, r) => a + r.refQty * (r.refPrice ?? 0), 0) <= 500_000,
+  true,
+);
+
+console.log("\n=== 자리를 두지 않는 카테고리는 한 종목만 담는다 ===");
+const twoInDivGrowth = normalizePicks(
+  {
+    picks: [
+      { category: "배당성장", action: "buy", ticker: "446720", etf_name: "A", ref_price: 14_000, ref_qty: 1, rationale: "", source_doc_ids: [], source_urls: [] },
+      { category: "배당성장", action: "buy", ticker: "402970", etf_name: "B", ref_price: 12_000, ref_qty: 1, rationale: "", source_doc_ids: [], source_urls: [] },
+    ],
+  },
+  { balances, injectedDocIds: [] },
+);
+check("1행", twoInDivGrowth.rows.length, 1);
+check("전액 배정", twoInDivGrowth.rows[0].budgetKrw, 350_000);
+check("자리 없음", twoInDivGrowth.rows[0].role, null);
+check(
+  "사유 기록",
+  twoInDivGrowth.dropped.some((d) => d.includes("배당성장은 한 종목만 담는다")),
+  true,
+);
+
+console.log("\n=== 대조군: 자리를 두지 않는 카테고리는 자리 도입 전과 같다 ===");
+check("3행 그대로", buy.rows.length, 3);
+check("배당성장·고배당은 자리·비중 없음", [buy.rows[0].role, buy.rows[0].weight, buy.rows[2].role, buy.rows[2].weight], [null, null, null, null]);
+check("  배정액 = 각 카테고리 잔액", [buy.rows[0].budgetKrw, buy.rows[2].budgetKrw], [350_000, 140_000]);
+check("  수량도 그대로", [buy.rows[0].refQty, buy.rows[2].refQty], [24, 15]);
+check("자산성장만 자리 몫으로 줄어든다", [buy.rows[1].role, buy.rows[1].budgetKrw, buy.rows[1].refQty], ["aggressive", 105_000, 3]);
+check("  대조군: 전액이었다면 floor(210000/26335)", computeRefQty(210_000, 0, 26_335), 7);
 
 console.log(`\n=== 결과: ${failed === 0 ? "전부 통과" : `${failed}건 실패`} ===`);
 process.exit(failed === 0 ? 0 : 1);

@@ -22,6 +22,7 @@ import {
 } from "../src/domain/ledger";
 import { addPurchase, getHoldings, updatePurchase } from "../src/domain/purchases";
 import { formatKRW, monthsAfter } from "../src/domain/money";
+import { guardAgainstRealData } from "./lib/guard";
 
 let failed = 0;
 function check(label: string, actual: unknown, expected: unknown) {
@@ -36,33 +37,6 @@ async function reset() {
   await db.execute(
     sql`truncate ${ledger}, ${purchases}, ${purchaseCycles}, ${settings} restart identity cascade`,
   );
-}
-
-/**
- * 이 스크립트는 테이블을 비운다. 실제로 쓰고 있는 DB를 가리키면 매입 기록과
- * 잔액이 통째로 날아가므로, 데이터가 들어 있으면 실행을 거부한다.
- * 검증용 DB를 쓰려면 DATABASE_URL을 그 DB로 지정해서 실행할 것.
- */
-async function guardAgainstRealData() {
-  const [row] = await db
-    .select({
-      n: sql<number>`(select count(*) from ${purchases})::int + (select count(*) from ${settings})::int`,
-    })
-    .from(sql`(select 1) as _`);
-
-  if (Number(row?.n ?? 0) > 0 && process.env.ALLOW_WIPE !== "1") {
-    console.error(
-      [
-        "이 DB에는 이미 데이터가 있습니다. 검증 스크립트는 테이블을 비우므로 중단합니다.",
-        "",
-        "  검증용 DB로 실행:",
-        "    DATABASE_URL=postgresql://etf_advisor:…@localhost:5433/etf_advisor_test pnpm run check:ledger",
-        "",
-        "  (정말로 이 DB를 비우려면 ALLOW_WIPE=1)",
-      ].join("\n"),
-    );
-    process.exit(2);
-  }
 }
 
 async function main() {

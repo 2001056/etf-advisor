@@ -1,20 +1,35 @@
-import { getMonthlyTopup } from "@/domain/ledger";
-import { CATEGORIES, CATEGORY_LABEL, formatKRW } from "@/domain/money";
+import { getGrowthRoleWeights, getMonthlyTopup } from "@/domain/ledger";
+import {
+  CATEGORIES,
+  CATEGORY_LABEL,
+  formatKRW,
+} from "@/domain/money";
+import {
+  activeCategories,
+  GROWTH_ROLES,
+  GROWTH_ROLE_HINT,
+  GROWTH_ROLE_LABEL,
+  ROLE_CATEGORY,
+} from "@/domain/recommendation";
 import { getAllPrompts, PROMPT_META, PromptSlot } from "@/domain/prompts";
 import { Card, Notice, Page } from "@/components/ui";
 import PromptForm from "./prompt-form";
 import TopupForm from "./topup-form";
+import GrowthRolesForm from "./growth-roles-form";
 
 export const dynamic = "force-dynamic";
 
 const SLOTS: PromptSlot[] = ["weekly", "purchase", "recommend"];
 
 export default async function SettingsPage() {
-  const [topup, prompts] = await Promise.all([
+  const [topup, prompts, roleWeights] = await Promise.all([
     getMonthlyTopup(),
     getAllPrompts(),
+    getGrowthRoleWeights(),
   ]);
   const total = CATEGORIES.reduce((s, c) => s + topup[c], 0);
+  // 전부 0이면 세 카테고리 모두 활성이라 충전액 0만으로는 비활성이 아니다
+  const roleActive = activeCategories(topup).includes(ROLE_CATEGORY);
 
   return (
     <Page current="/settings">
@@ -25,6 +40,33 @@ export default async function SettingsPage() {
           values={topup}
           labels={Object.fromEntries(
             CATEGORIES.map((c) => [c, CATEGORY_LABEL[c]]),
+          )}
+        />
+      </Card>
+
+      <Card title={`${CATEGORY_LABEL[ROLE_CATEGORY]} 자리별 비중`}>
+        {!roleActive && (
+          <div className="mb-3">
+            <Notice kind="warn">
+              {CATEGORY_LABEL[ROLE_CATEGORY]} 월 충전액이 0이라 이번 회차{" "}
+              {CATEGORY_LABEL[ROLE_CATEGORY]}은 비활성입니다. 아래 비중은 다시
+              충전액을 넣은 회차부터 쓰입니다.
+            </Notice>
+          </div>
+        )}
+        <p className="mb-3 text-sm text-neutral-600">
+          {CATEGORY_LABEL[ROLE_CATEGORY]}은 한 종목에 몰아넣지 않고 성격이 다른 두
+          자리에 나눠 담습니다. 추천 에이전트는 자리마다 ETF를 하나씩 고르고,
+          자리별 배정액은 {CATEGORY_LABEL[ROLE_CATEGORY]} 잔액을 아래 비중대로 나눈
+          값입니다.
+        </p>
+        <GrowthRolesForm
+          values={roleWeights}
+          labels={Object.fromEntries(
+            GROWTH_ROLES.map((r) => [r, GROWTH_ROLE_LABEL[r]]),
+          )}
+          hints={Object.fromEntries(
+            GROWTH_ROLES.map((r) => [r, GROWTH_ROLE_HINT[r]]),
           )}
         />
       </Card>

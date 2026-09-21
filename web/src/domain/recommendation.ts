@@ -12,6 +12,56 @@ export const CATEGORY_FROM_KO: Record<string, Category> = {
   고배당: "high_div",
 };
 
+/**
+ * 자산성장 안의 두 자리. 한 종목에 몰아넣지 않고 성격이 다른 둘로 나눠 담는다.
+ * 비중은 모델이 아니라 설정(settings.growth_roles)이 정한다.
+ */
+export const GROWTH_ROLES = ["aggressive", "stable"] as const;
+export type GrowthRole = (typeof GROWTH_ROLES)[number];
+
+/** 자리를 두는 카테고리는 자산성장 하나뿐 — 배당성장·고배당은 예전처럼 1종목이다 */
+export const ROLE_CATEGORY: Category = "asset_growth";
+
+export const GROWTH_ROLE_LABEL: Record<GrowthRole, string> = {
+  aggressive: "공격적 성장",
+  stable: "안정적 성장",
+};
+
+export const GROWTH_ROLE_HINT: Record<GrowthRole, string> = {
+  aggressive: "변동이 크더라도 장기 기대 수익이 높은 성장 지수",
+  stable: "여러 업종에 분산하여 특정 업종·종목 의존도를 낮추는 주식 지수",
+};
+
+export const DEFAULT_GROWTH_ROLE_WEIGHTS: Record<GrowthRole, number> = {
+  aggressive: 0.5,
+  stable: 0.5,
+};
+
+export function toGrowthRole(v: unknown): GrowthRole | null {
+  const s = String(v ?? "").trim();
+  return (GROWTH_ROLES as readonly string[]).includes(s)
+    ? (s as GrowthRole)
+    : null;
+}
+
+/**
+ * 설정에 저장된 자리 비중을 읽을 수 있는 값으로 만든다.
+ * 한 자리라도 0 이하·1 이상이거나 합이 1에서 벗어나면 기본 50:50으로 되돌린다 —
+ * 깨진 설정 하나가 배정액을 잔액 밖으로 밀어내면 안 된다.
+ */
+export function normalizeRoleWeights(raw: unknown): Record<GrowthRole, number> {
+  const v = (raw ?? {}) as Record<string, unknown>;
+  const nums = GROWTH_ROLES.map((r) => Number(v[r]));
+  if (!nums.every((n) => Number.isFinite(n) && n > 0 && n < 1)) {
+    return { ...DEFAULT_GROWTH_ROLE_WEIGHTS };
+  }
+  const sum = nums.reduce((a, b) => a + b, 0);
+  if (Math.abs(sum - 1) > 0.02) return { ...DEFAULT_GROWTH_ROLE_WEIGHTS };
+  return Object.fromEntries(
+    GROWTH_ROLES.map((r, i) => [r, nums[i] / sum]),
+  ) as Record<GrowthRole, number>;
+}
+
 /** 활성 = 설정 화면의 월 충전액 > 0. 잔액은 보지 않는다 — 갈아타기 차액·분배금 같은 잔돈이 비활성 카테고리를 되살리면 안 된다 */
 export function activeCategories(topup: Record<Category, number>): Category[] {
   const active = CATEGORIES.filter((c) => (topup[c] ?? 0) > 0);
@@ -55,6 +105,36 @@ export function budgetLine(
   );
 }
 
+/**
+ * 자리 몫 = floor(잔액 × 비중). 두 몫의 합은 잔액을 넘지 않는다.
+ * 0.7 × 700,000이 489,999.99…로 나오는 부동소수 오차만 걷어낸다.
+ */
+export function seatBudget(balance: number, weight: number): number {
+  const exact = balance * weight;
+  const rounded = Math.round(exact);
+  return Math.abs(exact - rounded) < 1e-6 ? rounded : Math.floor(exact);
+}
+
+/** 자리 비중을 % 문자열로 — 프롬프트 줄과 화면 뱃지가 같은 식을 쓴다 (0.505 → "50.5", 0.5 → "50") */
+export function pct(w: number): string {
+  const v = Math.round(w * 1000) / 10;
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+
+/** 자산성장 잔액 줄 아래에 붙는 자리별 배정액 — 정규화와 같은 식을 쓴다 */
+export function roleBudgetLine(
+  balance: number,
+  weights: Record<GrowthRole, number> = DEFAULT_GROWTH_ROLE_WEIGHTS,
+): string {
+  return (
+    "  · " +
+    GROWTH_ROLES.map(
+      (r) =>
+        `${GROWTH_ROLE_LABEL[r]} 자리 ${pct(weights[r])}%: ${seatBudget(balance, weights[r]).toLocaleString("ko-KR")}원`,
+    ).join(" / ")
+  );
+}
+
 export function holdingLine(
   h: {
     category: Category;
@@ -71,17 +151,7 @@ export function holdingLine(
   );
 }
 
-/** 정규화에 넘길 보유 — 비활성 카테고리 보유는 갈아타기 매도 대상이 될 수 없다 */
-export function activeHoldings(
-  holdings: { category: Category; ticker: string; qty: number }[],
-  active: Category[],
-): { category: Category; ticker: string; qty: number }[] {
-  return holdings
-    .filter((h) => active.includes(h.category))
-    .map((h) => ({ category: h.category, ticker: h.ticker, qty: h.qty }));
-}
-
-/** 정규화에 넘길 잔액 — 비활성 카테고리에 잔돈이 있어도 0으로 둬 매수·갈아타기가 성립하지 않게 한다 */
+/** 정규화에 넘길 잔액 — 비활성 카테고리에 잔돈이 있어도 0으로 둬 매수가 성립하지 않게 한다 */
 export function activeBalances(
   balances: Record<Category, number>,
   active: Category[],
@@ -91,30 +161,83 @@ export function activeBalances(
   ) as Record<Category, number>;
 }
 
-export function recommendOutputRules(
-  active: Category[],
-  inactiveHeld: boolean,
-): string[] {
+function hhmmKST(d: Date): string {
+  return new Intl.DateTimeFormat("ko-KR", {
+    timeZone: "Asia/Seoul",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(d);
+}
+
+/**
+ * ③ 프롬프트에 ② 문서보다 먼저 넣는 실시간 시세 블록.
+ * ② 문서의 price는 조사 시점 스냅샷이라 1주 매수 가능 여부가 어긋난다.
+ */
+export function realtimePriceBlock(
+  tickers: string[],
+  quotes: Map<string, RealtimeQuote>,
+  now: Date = new Date(),
+): string {
+  const at = [...quotes.values()].reduce<Date | null>(
+    (latest, q) => (latest === null || q.pricedAt > latest ? q.pricedAt : latest),
+    null,
+  );
+  const lines = tickers.map((t) => {
+    const q = quotes.get(t);
+    return q
+      ? `- ${t}: ${q.price.toLocaleString("ko-KR")}원 (${hhmmKST(q.pricedAt)})`
+      : `- ${t}: 실시간가 없음`;
+  });
+  const got = tickers.map((t) => quotes.get(t)).filter((q) => q !== undefined);
+  // 하나라도 장중이 아니면 종가를 섞어 보는 셈이라 장중이라고 말하지 않는다
+  const marketLabel =
+    got.length === 0
+      ? "장 상태 확인 불가"
+      : got.every((q) => q.marketStatus === "OPEN")
+        ? "장중"
+        : "장 마감 후 종가";
+  return [
+    `[실시간 시세 — ${hhmmKST(at ?? now)} KST 기준, ${marketLabel}, 매수 가능 여부와 ref_qty는 이 값으로 판단]`,
+    ...(lines.length ? lines : ["- (조회 대상 종목 없음)"]),
+  ].join("\n");
+}
+
+export function recommendOutputRules(active: Category[]): string[] {
   const labels = active.map((c) => CATEGORY_LABEL[c]).join("·");
-  const countRule =
-    active.length === CATEGORIES.length
-      ? "- 세 카테고리(배당성장·자산성장·고배당) 각각 정확히 한 번씩, 총 3개를 picks에 담아라."
-      : active.length === 1
-        ? `- 이번 회차 활성 카테고리는 ${labels}뿐이다. ${labels} 한 개만 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.`
-        : `- 이번 회차 활성 카테고리는 ${labels}뿐이다. ${labels} 각각 정확히 한 번씩, 총 ${active.length}개를 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.`;
+  // 자산성장은 두 자리를 쓰므로 "각각 한 번씩, 총 N개"가 성립하지 않는다.
+  // 개수는 자리를 두지 않는 카테고리만 세고, 자산성장은 아래 자리 규칙에 맡긴다.
+  const hasRole = active.includes(ROLE_CATEGORY);
+  const others = active.filter((c) => c !== ROLE_CATEGORY);
+  const otherLabels = others.map((c) => CATEGORY_LABEL[c]).join("·");
+  const roleLabel = CATEGORY_LABEL[ROLE_CATEGORY];
+
+  // 자산성장이 비활성이면 활성은 최대 2개라 "세 카테고리 … 총 3개" 가지는 도달할 수 없다
+  const countRule = !hasRole
+    ? active.length === 1
+      ? `- 이번 회차 활성 카테고리는 ${labels}뿐이다. ${labels} 한 개만 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.`
+      : `- 이번 회차 활성 카테고리는 ${labels}뿐이다. ${labels} 각각 정확히 한 번씩, 총 ${active.length}개를 picks에 담아라. 다른 카테고리는 이번 회차에 매수하지 않는다.`
+    : others.length === 0
+      ? `- 이번 회차 활성 카테고리는 ${roleLabel}뿐이다. ${roleLabel}만 picks에 담고, 몇 개를 담을지는 아래 자리 규칙을 따른다. 다른 카테고리는 이번 회차에 매수하지 않는다.`
+      : active.length === CATEGORIES.length
+        ? `- ${otherLabels}은 각각 정확히 한 번씩 picks에 담고, ${roleLabel}은 아래 자리 규칙을 따른다.`
+        : `- 이번 회차 활성 카테고리는 ${labels}뿐이다. ${otherLabels}은 정확히 한 번씩 picks에 담고, ${roleLabel}은 아래 자리 규칙을 따른다. 다른 카테고리는 이번 회차에 매수하지 않는다.`;
+
+  // 자산성장만 두 자리로 나눠 담는다. 앞줄의 개수 규칙에 대한 예외라 바로 뒤에 붙인다.
+  const roleRules = active.includes(ROLE_CATEGORY)
+    ? [
+        `- ${CATEGORY_LABEL[ROLE_CATEGORY]}만은 예외다. ${GROWTH_ROLE_LABEL.aggressive} 자리(role="aggressive", ${GROWTH_ROLE_HINT.aggressive})와 ${GROWTH_ROLE_LABEL.stable} 자리(role="stable", ${GROWTH_ROLE_HINT.stable})에 ETF를 하나씩 골라 ${CATEGORY_LABEL[ROLE_CATEGORY]} pick 2개를 담아라. 두 자리에 같은 종목이나 같은 기초지수를 넣지 마라.`,
+        `- role은 ${CATEGORY_LABEL[ROLE_CATEGORY]} pick에만 "aggressive" 또는 "stable"로 적고 다른 카테고리 pick은 null로 둔다. 자리 비중과 자리별 budget_krw는 시스템이 ${CATEGORY_LABEL[ROLE_CATEGORY]} 잔액을 나눠 채우므로 직접 계산하지 마라. 두 자리에 같은 종목을 넣으면 ${GROWTH_ROLE_LABEL.aggressive} 자리만 남고 ${GROWTH_ROLE_LABEL.stable} 자리는 비운다. 건너뛴 자리의 몫은 ${CATEGORY_LABEL[ROLE_CATEGORY]} 잔액으로 이월되어 다음 회차에 다시 자리 비중대로 나뉜다. 다른 카테고리로는 가지 않는다.`,
+      ]
+    : [];
 
   return [
     countRule,
-    "- 매수면 action=\"buy\", 건너뜀이면 action=\"skip\", 보유 종목을 팔고 다른 종목으로 교체하는 게 낫다고 판단되면 action=\"switch\".",
+    ...roleRules,
+    "- action은 buy 또는 skip만 쓴다. 기존 보유분 매도·교체는 이 단계에서 제안하지 않는다(매도·교체 검토는 ④, 중복 보유 정리는 ⑤).",
     "- action=skip이면 ticker·etf_name·ref_price는 null, ref_qty는 0으로 둔다. 값을 지어내지 마라.",
-    "- action=switch이면 sell_ticker=팔 보유 종목 코드, sell_qty=팔 수량(위 보유 현황의 수량 이내), sell_ref_price=그 종목의 조사 가격. ticker·etf_name·ref_price에는 새로 살 종목을 적는다. 갈아타기의 근거(왜 파는지, 왜 그 종목으로 가는지)를 rationale에 조사 수치를 인용해 설명하라.",
-    "- action이 buy나 skip이면 sell_ticker·sell_qty·sell_ref_price는 null로 둔다.",
-    "- 보유하지 않은 종목을 팔라고 하지 마라. 갈아타기는 위 [현재 보유 현황]에 있는 종목만 대상으로 한다." +
-      (inactiveHeld
-        ? ` ${INACTIVE_HOLDING_MARK} 표시가 붙은 종목은 팔거나 갈아타지 않는다.`
-        : ""),
-    "- ref_price는 위 매입 시점 조사 문서의 price를 그대로 쓴다.",
-    "- ref_qty: buy면 floor(budget_krw ÷ ref_price), switch면 floor((budget_krw + sell_qty×sell_ref_price) ÷ ref_price).",
+    "- ref_price는 [실시간 시세]의 값만 쓴다. 실시간가가 없는 종목은 이번 회차 후보에서 제외한다 — ② 문서의 price로 대체하지 마라.",
+    "- ref_qty: floor(budget_krw ÷ ref_price).",
     "- source_doc_ids에는 위에 표시된 research_doc_id 중 실제로 근거로 쓴 것만 넣어라.",
     "- JSON 밖에는 아무것도 출력하지 마라.",
   ];
@@ -165,6 +288,10 @@ export function nonNegativeInt(v: unknown): number | null {
 
 export type NormalizedPick = {
   category: Category;
+  /** 자산성장을 나눠 담은 자리. 자리를 두지 않는 카테고리는 null */
+  role: GrowthRole | null;
+  /** 자리를 둘 다 채웠을 때 그 자리에 준 비중. 한 종목으로 끝나면 null */
+  weight: number | null;
   ticker: string | null;
   etfName: string | null;
   budgetKrw: number;
@@ -190,7 +317,11 @@ export type NormalizedPick = {
 export type PriceSource = "realtime" | "research";
 
 /** 실시간 시세 한 건 — server/livePrice.getRealtimePrices의 결과에서 쓰는 부분만 */
-export type RealtimeQuote = { price: number; pricedAt: Date };
+export type RealtimeQuote = {
+  price: number;
+  pricedAt: Date;
+  marketStatus?: string | null;
+};
 
 export type NormalizeResult = {
   rows: NormalizedPick[];
@@ -245,10 +376,12 @@ export function normalizePicks(
   ctx: {
     balances: Record<Category, number>;
     injectedDocIds: number[];
-    /** 갈아타기 검증용 현재 보유. (category, ticker) 단위 수량 */
-    holdings?: { category: Category; ticker: string; qty: number }[];
     /** 주면 그 밖의 카테고리 pick은 건너뜀 — 고배당 건너뜀 재배분으로 비활성 카테고리에 돈이 흘러가지 않게 */
     active?: Category[];
+    /** 자산성장 자리 비중. 없으면 기본 50:50 */
+    roleWeights?: Record<GrowthRole, number>;
+    /** ② 최신 문서 데이터 표의 티커→price. researchPrice에 채워 ② 오파싱 탐지의 기준이 된다 */
+    researchPrices?: Map<string, number>;
   },
 ): NormalizeResult {
   const list = Array.isArray(raw)
@@ -261,12 +394,11 @@ export function normalizePicks(
   // 1차: 카테고리·종목·가격을 정리하고 건너뜀 여부를 판정한다
   type Draft = {
     category: Category;
+    /** 모델이 적어 온 자리. 자리 배정은 아래 2차에서 다시 정한다 */
+    role: GrowthRole | null;
     ticker: string | null;
     etfName: string | null;
     refPrice: number | null;
-    sellTicker: string | null;
-    sellQty: number | null;
-    sellRefPrice: number | null;
     skipped: boolean;
     /** 모델이 명시적으로 action="skip"이라고 한 경우에만 true */
     explicitSkip: boolean;
@@ -289,55 +421,27 @@ export function normalizePicks(
 
     const price = positiveInt(p.ref_price);
     const ticker = String(p.ticker ?? "").replace(/[^0-9A-Za-z]/g, "");
-    const explicitSkip = String(p.action ?? "").trim() === "skip";
+    const action = String(p.action ?? "").trim();
+    const explicitSkip = action === "skip";
     const inactive = ctx.active ? !ctx.active.includes(category) : false;
     const skipped = explicitSkip || inactive || !ticker || price === null;
 
-    // 갈아타기(action="switch"): 팔 종목이 실제 보유와 맞아야만 인정한다.
-    // 모델 출력은 보장이 아니므로 여기서 보유 대조 후, 안 맞으면 매수로 강등한다.
-    const wantSwitch = String(p.action ?? "").trim() === "switch";
+    // ③은 더 이상 갈아타기를 만들지 않는다 — 옛 형식이 와도 매수로만 받는다
+    if (action === "switch") {
+      dropped.push(`③은 갈아타기를 쓰지 않음 — 매수로 처리: ${ticker || "?"}`);
+    }
     if (inactive && !explicitSkip) {
       dropped.push(
-        wantSwitch
-          ? `이번 회차 매수 대상이 아닌 카테고리라 갈아타기를 적용하지 않음 — ${CATEGORY_LABEL[category]} ${String(p.sell_ticker ?? "?")} → ${ticker || "?"}`
-          : `이번 회차 매수 대상이 아닌 카테고리라 매수하지 않음 — ${CATEGORY_LABEL[category]} ${ticker || "?"}`,
+        `이번 회차 매수 대상이 아닌 카테고리라 매수하지 않음 — ${CATEGORY_LABEL[category]} ${ticker || "?"}`,
       );
-    }
-    let sellTicker: string | null = null;
-    let sellQty: number | null = null;
-    let sellRefPrice: number | null = null;
-    if (wantSwitch && !skipped) {
-      const st = String(p.sell_ticker ?? "").replace(/[^0-9A-Za-z]/g, "");
-      const sq = positiveInt(p.sell_qty);
-      const held = ctx.holdings?.find(
-        (h) => h.category === category && h.ticker === st,
-      );
-      if (!st || !sq || !held) {
-        dropped.push(
-          `갈아타기 무효(보유 확인 실패: '${st || "?"}') → 매수로 강등 — ${ticker}`,
-        );
-      } else {
-        sellTicker = st;
-        sellRefPrice = positiveInt(p.sell_ref_price);
-        if (sq > held.qty) {
-          dropped.push(
-            `갈아타기 매도 수량 초과(보유 ${held.qty}주 < ${sq}주) → 보유 전량으로 조정 — ${st}`,
-          );
-          sellQty = held.qty;
-        } else {
-          sellQty = sq;
-        }
-      }
     }
 
     drafts.push({
       category,
+      role: category === ROLE_CATEGORY ? toGrowthRole(p.role) : null,
       ticker: skipped ? null : ticker,
       etfName: skipped ? null : String(p.etf_name ?? ""),
       refPrice: skipped ? null : price,
-      sellTicker,
-      sellQty,
-      sellRefPrice,
       skipped,
       explicitSkip,
       rationale: String(p.rationale ?? ""),
@@ -350,48 +454,147 @@ export function normalizePicks(
     });
   }
 
-  // 2차: 건너뜀 여부가 다 정해진 뒤에 배정 금액과 수량을 시스템이 계산한다.
+  // 2차: 카테고리마다 몇 개를 담을지 정한다.
+  //      자산성장은 공격·안정 두 자리, 나머지는 예전처럼 1종목이다.
+  //      자리를 안 정하고 같은 카테고리 pick을 여러 개 두면 아래 배정 금액이
+  //      pick마다 전액으로 들어가 수량 합계가 잔액을 넘는다.
+  const roleWeights = ctx.roleWeights ?? DEFAULT_GROWTH_ROLE_WEIGHTS;
+  /** 저장하지 않고 버릴 draft */
+  const dead = new Set<Draft>();
+  /** 자리 배정 결과 (한 자리만 채워도 기록한다 — 나중에 보유 종목의 자리를 알기 위해) */
+  const seatOf = new Map<Draft, GrowthRole>();
+  /** 자리에 앉은 pick의 비중. 두 자리를 한 종목으로 합쳤을 때만 비어 있다 */
+  const splitOf = new Map<Draft, number>();
+
+  for (const category of CATEGORIES) {
+    const mine = drafts.filter((d) => d.category === category);
+
+    if (category !== ROLE_CATEGORY) {
+      for (const d of mine.filter((x) => !x.skipped).slice(1)) {
+        dead.add(d);
+        dropped.push(
+          `${CATEGORY_LABEL[category]}은 한 종목만 담는다 — 두 번째 pick 제외 — ${d.ticker ?? "?"}`,
+        );
+      }
+      continue;
+    }
+
+    // 자리를 명시한 pick이 먼저 앉고, 자리를 안 적은 pick이 남은 자리를 채운다
+    const seats = new Map<GrowthRole, Draft>();
+    const unseated: Draft[] = [];
+    for (const d of mine) {
+      if (!d.role) {
+        unseated.push(d);
+        continue;
+      }
+      if (seats.has(d.role)) {
+        dead.add(d);
+        dropped.push(
+          `${CATEGORY_LABEL[category]} ${GROWTH_ROLE_LABEL[d.role]} 자리에 pick이 둘 — 먼저 나온 것만 씀 — ${d.ticker ?? "?"}`,
+        );
+        continue;
+      }
+      seats.set(d.role, d);
+    }
+    for (const d of unseated) {
+      const free = GROWTH_ROLES.find((r) => !seats.has(r));
+      if (!free) {
+        dead.add(d);
+        dropped.push(
+          `${CATEGORY_LABEL[category]} 자리 ${GROWTH_ROLES.length}개가 이미 차서 제외 — ${d.ticker ?? "?"}`,
+        );
+        continue;
+      }
+      dropped.push(
+        `${CATEGORY_LABEL[category]} pick에 role이 없어 ${GROWTH_ROLE_LABEL[free]} 자리로 배정 — ${d.ticker ?? "?"}`,
+      );
+      seats.set(free, d);
+    }
+
+    // 두 자리에 같은 종목이면 나눠 담은 게 아니다. filled는 GROWTH_ROLES 순서라
+    // 모델이 어느 자리를 먼저 냈든 aggressive가 남고 stable 자리를 비운다.
+    // 합쳐서 잔액 전부를 한 종목에 몰아주지 않는다.
+    const filled = GROWTH_ROLES.filter((r) => seats.has(r));
+    if (filled.length === 2) {
+      const [first, second] = filled.map((r) => seats.get(r)!);
+      if (
+        !first.skipped &&
+        !second.skipped &&
+        first.ticker &&
+        first.ticker === second.ticker
+      ) {
+        dead.add(second);
+        seats.delete(filled[1]);
+        dropped.push(
+          `${CATEGORY_LABEL[category]} 두 자리에 같은 종목 — ${GROWTH_ROLE_LABEL[filled[1]]} 자리 비움 — ${first.ticker}`,
+        );
+      }
+    }
+
+    for (const [role, d] of seats) seatOf.set(d, role);
+    // 자리에 앉은 pick은 자리 수와 무관하게 그 자리 몫만 받는다.
+    for (const [role, d] of seats) splitOf.set(d, roleWeights[role]);
+    const empty = GROWTH_ROLES.length - seats.size;
+    if (seats.size > 0 && empty > 0) {
+      dropped.push(
+        `${CATEGORY_LABEL[category]} 자리 ${empty}개가 비어 그 몫은 ${CATEGORY_LABEL[category]} 잔액으로 이월`,
+      );
+    }
+  }
+
+  // 3차: 건너뜀 여부가 다 정해진 뒤에 배정 금액과 수량을 시스템이 계산한다.
   //      (고배당 건너뜀이면 그 잔액이 배당성장·자산성장으로 재배분된다)
-  const highDiv = drafts.find((d) => d.category === "high_div");
+  const highDivDrafts = drafts.filter((d) => d.category === "high_div");
+  const hasLive = (c: Category) =>
+    drafts.some((d) => d.category === c && !d.skipped && !dead.has(d));
   const skippedMap = {
-    // 받을 쪽: pick이 없으면 쓸 곳이 없으니 배정하지 않는다
-    div_growth: drafts.find((d) => d.category === "div_growth")?.skipped ?? true,
-    asset_growth:
-      drafts.find((d) => d.category === "asset_growth")?.skipped ?? true,
+    // 받을 쪽: 살아 있는 pick이 하나도 없으면 쓸 곳이 없으니 배정하지 않는다
+    div_growth: !hasLive("div_growth"),
+    asset_growth: !hasLive("asset_growth"),
     // 줄 쪽: 모델이 명시적으로 skip이라고 한 경우에만 재배분한다.
     // pick이 없거나(출력 불완전) buy인데 가격이 빠진 경우(데이터 오류)까지
     // 재배분하면 실수로 돈이 조용히 옮겨간다.
-    high_div: highDiv ? highDiv.explicitSkip : false,
+    high_div:
+      highDivDrafts.length > 0 &&
+      highDivDrafts.every((d) => d.skipped) &&
+      highDivDrafts.some((d) => d.explicitSkip),
   };
   const budgets = allocateBudgets(ctx.balances, skippedMap);
 
-  const rows: NormalizedPick[] = drafts.map((d) => {
-    // 갈아타기는 매도 예상대금(수량×조사가)이 매수 재원에 더해진다.
-    // 매도가를 모르면 0으로 두고 배정 잔액만으로 계산한다(보수적).
-    const proceeds =
-      d.sellTicker && d.sellQty && d.sellRefPrice
-        ? d.sellQty * d.sellRefPrice
-        : 0;
-    // 배정 금액(+매도대금)으로 1주도 못 사면 결국 건너뜀이다
+  const rows: NormalizedPick[] = drafts.filter((d) => !dead.has(d)).map((d) => {
+    // 자리에 앉았으면 카테고리 배정액을 비중대로 나눈 몫이 이 pick의 예산이다.
+    // 내림이라 두 몫의 합은 배정액을 넘지 않는다 — 남는 잔돈은 다음 달로 이월된다.
+    const weight = splitOf.get(d) ?? null;
+    const budget =
+      weight === null
+        ? budgets[d.category]
+        : seatBudget(budgets[d.category], weight);
+    // 배정 금액으로 1주도 못 사면 결국 건너뜀이다
     const qty =
       d.skipped || d.refPrice === null
         ? 0
-        : computeRefQty(budgets[d.category], proceeds, d.refPrice);
+        : computeRefQty(budget, 0, d.refPrice);
     const skipped = d.skipped || qty <= 0;
 
     return {
       category: d.category,
+      role: seatOf.get(d) ?? null,
+      weight,
       ticker: skipped ? null : d.ticker,
       etfName: skipped ? null : d.etfName,
-      // 건너뛴 카테고리는 재배분 전 자기 잔액을 그대로 보여준다(이월액)
-      budgetKrw: skipped ? ctx.balances[d.category] : budgets[d.category],
+      // 건너뛴 카테고리는 재배분 전 자기 잔액을 그대로 보여준다(이월액).
+      // 자리를 나눈 경우에는 그 자리 몫만 이월된다 — 다른 자리로 넘어가지 않는다.
+      budgetKrw: skipped && weight === null ? ctx.balances[d.category] : budget,
       refPrice: skipped ? null : d.refPrice,
       refQty: qty,
-      sellTicker: skipped ? null : d.sellTicker,
-      sellQty: skipped ? null : d.sellQty,
-      sellRefPrice: skipped ? null : d.sellRefPrice,
-      researchPrice: skipped ? null : d.refPrice,
-      sellResearchPrice: skipped ? null : d.sellRefPrice,
+      sellTicker: null,
+      sellQty: null,
+      sellRefPrice: null,
+      // 모델이 적어 온 ref_price는 [실시간 시세] 값이라 원값이 아니다.
+      // ② 문서 표의 값을 넣어야 isDrift가 ② 오파싱을 잡아낸다.
+      researchPrice:
+        skipped || !d.ticker ? null : (ctx.researchPrices?.get(d.ticker) ?? null),
+      sellResearchPrice: null,
       priceSource: "research",
       pricedAt: null,
       skipped,
@@ -423,11 +626,41 @@ export type RealtimeApplyResult = {
 };
 
 /**
+ * 실시간가를 못 쓴 매수 행은 조사가로 대체하지 않고 이번 회차에서 뺀다.
+ *
+ * 이월액(budgetKrw)은 normalizePicks의 불변식과 같은 값이어야 한다 —
+ * 자리를 나누지 않은 행(weight === null)은 재배분 전 자기 카테고리 잔액,
+ * 자리에 앉은 행은 그 자리 몫. balances를 안 주면 정규화가 준 값을 그대로 둔다.
+ */
+function excludeForNoLivePrice(
+  r: NormalizedPick,
+  reason: string,
+  balances?: Record<Category, number>,
+): NormalizedPick {
+  return {
+    ...r,
+    ticker: null,
+    etfName: null,
+    refPrice: null,
+    refQty: 0,
+    budgetKrw:
+      r.weight === null && balances ? balances[r.category] : r.budgetKrw,
+    priceSource: "research",
+    pricedAt: null,
+    skipped: true,
+    rationale: r.rationale ? `${r.rationale}\n${reason}` : reason,
+  };
+}
+
+/**
  * 정규화된 추천의 기준가를 추천 시점의 실시간 체결가로 갈아끼운다.
  *
  * 조사 문서의 price는 ②가 웹을 훑은 시점 값이라 몇 분~몇 시간 묵는다. 증권사 앱은
  * KRX 체결가를 보여주므로 그대로 두면 "몇 주 살 수 있는지"가 어긋난다.
- * 실시간가를 못 얻은 종목은 조사 가격을 그대로 둔다. 원값은 researchPrice에 남는다.
+ *
+ * ③이 만드는 매수 행은 실시간가가 필수다 — 못 얻었거나 조사가와 30% 넘게 벌어져
+ * 버린 경우에는 조사가로 대체하지 않고 그 자리를 이번 회차에서 뺀다(몫은 이월).
+ * 옛 갈아타기 행(sell_ticker가 있는 행)은 예전 규칙 그대로 둔다.
  *
  * 갈아끼운 뒤 수량이 0이 되면 그 행은 매수·매도 다리를 모두 되돌린다 —
  * normalizePicks가 세운 "수량 0이면 반드시 건너뜀"을 여기서 깨면 안 되고,
@@ -436,6 +669,8 @@ export type RealtimeApplyResult = {
 export function applyRealtimePrices(
   rows: NormalizedPick[],
   quotes: Map<string, RealtimeQuote>,
+  /** 정규화에 넘겼던 재배분 전 잔액 — 행을 빼낼 때 이월액을 정규화와 같은 값으로 되돌린다 */
+  balances?: Record<Category, number>,
 ): RealtimeApplyResult {
   const excluded: string[] = [];
   let applied = 0;
@@ -448,16 +683,45 @@ export function applyRealtimePrices(
     const buyRaw = quotes.get(r.ticker);
     const sellRaw = r.sellTicker ? quotes.get(r.sellTicker) : undefined;
 
+    // 기준은 ② 문서 표의 가격뿐이다. researchPrice가 없으면(표에 없는 티커) 견줄 원값이
+    // 없으므로 드리프트 검사를 건너뛰고 실시간가를 채택한다 —
+    // refPrice를 기준으로 삼으면 모델이 적어 온 실시간가끼리 재는 꼴이라 ② 오파싱을 못 잡는다.
     const buyDrift =
-      buyRaw !== undefined && isDrift(buyRaw.price, r.researchPrice ?? r.refPrice);
+      buyRaw !== undefined && isDrift(buyRaw.price, r.researchPrice);
     const sellDrift =
       sellRaw !== undefined &&
       isDrift(sellRaw.price, r.sellResearchPrice ?? r.sellRefPrice);
-    if (buyDrift) excluded.push(`${r.ticker} 조사가와 30% 넘게 차이`);
-    if (sellDrift) excluded.push(`${r.sellTicker} 매도가가 조사가와 30% 넘게 차이`);
 
     const buy = buyRaw && !buyDrift ? buyRaw : null;
     const sell = sellRaw && !sellDrift ? sellRaw : null;
+
+    if (r.sellTicker === null) {
+      if (!buy) {
+        const reason = buyDrift
+          ? `${r.ticker} 실시간가가 조사가와 30% 넘게 차이 — 이번 회차 제외`
+          : `${r.ticker} 실시간가 없음 — 이번 회차 제외`;
+        excluded.push(reason);
+        return excludeForNoLivePrice(r, reason, balances);
+      }
+      const liveQty = computeRefQty(r.budgetKrw, 0, buy.price);
+      if (liveQty <= 0) {
+        const reason = `${r.ticker} 실시간가로는 1주도 못 산다 — 이번 회차 제외`;
+        excluded.push(reason);
+        return excludeForNoLivePrice(r, reason, balances);
+      }
+      applied++;
+      return {
+        ...r,
+        refPrice: buy.price,
+        refQty: liveQty,
+        priceSource: "realtime" as PriceSource,
+        pricedAt: buy.pricedAt,
+      };
+    }
+
+    // 새 데이터에서는 도달 불가 — ③이 더 이상 sellTicker를 만들지 않으므로 옛 행 재처리용 보존 경로다
+    if (buyDrift) excluded.push(`${r.ticker} 조사가와 30% 넘게 차이`);
+    if (sellDrift) excluded.push(`${r.sellTicker} 매도가가 조사가와 30% 넘게 차이`);
     if (!buy && !sell) {
       if (!buyDrift && !sellDrift) excluded.push(`${r.ticker} 실시간가 없음`);
       return r;

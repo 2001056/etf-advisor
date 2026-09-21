@@ -1,3 +1,4 @@
+import { Fragment } from "react";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import {
@@ -16,7 +17,11 @@ import {
 import {
   activeCategories,
   computeRefQty,
+  GROWTH_ROLE_LABEL,
   isDrift,
+  pct,
+  ROLE_CATEGORY,
+  toGrowthRole,
 } from "@/domain/recommendation";
 import { getAllPrompts } from "@/domain/prompts";
 import { acceptedRecommendationIds } from "@/domain/purchases";
@@ -88,7 +93,7 @@ export default async function RecommendPage() {
   const quoteTickers = [
     ...new Set(
       (latest?.picks ?? [])
-        .flatMap((p) => [p.ticker, p.sellTicker])
+        .map((p) => p.ticker)
         .filter((t): t is string => Boolean(t)),
     ),
   ];
@@ -112,97 +117,23 @@ export default async function RecommendPage() {
   const nowQtyOf = (p: Pick) => {
     const price = nowOf(p)?.price;
     if (!price) return 0;
-    const sellPrice = p.sellTicker
-      ? (now.get(p.sellTicker)?.price ?? p.sellRefPrice)
-      : null;
-    const proceeds = p.sellQty && sellPrice ? p.sellQty * sellPrice : 0;
-    return computeRefQty(p.budgetKrw, proceeds, price);
+    return computeRefQty(p.budgetKrw, 0, price);
   };
 
-  return (
-    <Page current="/">
-      <h1 className="text-xl font-bold">매입 추천</h1>
+  /** DB 값이라 자리 이름이 깨져 있을 수 있다 — 아는 자리만 뱃지로 보여준다 */
+  const seatOf = (p: Pick) => toGrowthRole(p.role);
 
-      {placeholders.length > 0 && (
-        <Notice kind="warn">
-          아직 자리표시자 프롬프트로 돌아갑니다 (
-          {placeholders.map((s) => (s === "purchase" ? "②" : "③")).join(", ")}).
-          결과 품질을 원하시면{" "}
-          <Link href="/settings" className="underline">
-            설정
-          </Link>
-          에서 직접 쓴 프롬프트를 넣으세요.
-        </Notice>
-      )}
+  // 한 카테고리를 두 자리로 나눠 담으면 배정액이 잔액을 쪼갠 값이라
+  // 따로 떨어뜨려 두면 합이 읽히지 않는다 — 한 카드 안에 나란히 둔다.
+  const groups: { category: Category; picks: Pick[] }[] = [];
+  for (const p of latest?.picks ?? []) {
+    const c = p.category as Category;
+    const g = groups.find((x) => x.category === c);
+    if (g) g.picks.push(p);
+    else groups.push({ category: c, picks: [p] });
+  }
 
-      <Card title="추천 실행">
-        <Runner busyAtLoad={Boolean(running)} />
-        <p className="mt-4 text-sm">
-          이번 회차 활성 카테고리:{" "}
-          <b>{active.map((c) => CATEGORY_LABEL[c]).join("·")}</b>
-          <span className="ml-1 text-xs text-neutral-500">
-            (
-            <Link href="/settings" className="underline">
-              설정
-            </Link>
-            의 월 충전액이 0보다 큰 카테고리. 모두 0이면 세 카테고리 전부.
-            나머지 카테고리 보유 종목은 매수·갈아타기 없이 ④ 보유 점검만 계속합니다)
-          </span>
-        </p>
-        <p className="mt-2 text-xs text-neutral-500">
-          이번에 재조사할 종목 {tickers.length}개
-          {tickers.length > 0 && `: ${tickers.join(", ")}`}
-          {tickers.length === 0 &&
-            " — 조사 문서와 보유 종목이 아직 없어 ②가 조사 대상을 찾지 못합니다. 먼저 정기 조사를 한 번 돌리세요."}
-        </p>
-      </Card>
-
-      <Card title="카테고리별 현재 잔액 = 이번 회차 배정 금액">
-        <div className="grid gap-3 sm:grid-cols-3">
-          {CATEGORIES.map((c) => (
-            <div key={c} className="rounded-lg border border-neutral-200 p-4">
-              <div className="text-sm text-neutral-600">{CATEGORY_LABEL[c]}</div>
-              <div className="mt-1 text-lg font-bold tabular-nums">
-                {formatKRW(balances[c])}
-              </div>
-            </div>
-          ))}
-        </div>
-        <p className="mt-3 text-xs text-neutral-500">
-          추천 에이전트는 이 잔액을 그대로 배정 금액으로 받아 카테고리별로 몇 주를
-          살 수 있는지 계산합니다. 이월된 잔돈이 포함된 값이며, 카테고리 간 이동은
-          없습니다. 가격·수량은 참고치이므로 최종 확인은 증권사 앱에서 하세요.
-        </p>
-      </Card>
-
-      {latest && (
-        <Card
-          title={`추천 결과 (${stampKST(latest.run.finishedAt)})`}
-        >
-          <Notice kind="warn">
-            가격·수량은 조사 시점의 참고치입니다. 최종 확인과 실제 주문은 증권사
-            앱에서 하세요.
-          </Notice>
-
-          {latest.picks.some((p) => p.category === "high_div" && p.skipped) &&
-            latest.picks.some((p) => !p.skipped) && (
-              <div className="mt-3">
-                <Notice>
-                  고배당을 건너뛰어서 그 잔액이 <b>배당성장·자산성장에 5:3으로
-                  나눠</b> 배정되었습니다. 실제 자금 이동은 매입을 기록할 때
-                  모자란 만큼만 일어나고, 기록하지 않으면 고배당에 그대로
-                  남습니다.
-                </Notice>
-              </div>
-            )}
-
-          <div className="mt-4 space-y-4">
-            {latest.picks.length === 0 && (
-              <p className="text-sm text-neutral-500">
-                추천 항목이 저장되지 않았습니다. 실행 이력에서 로그를 확인하세요.
-              </p>
-            )}
-            {latest.picks.map((p) => (
+  const pickCard = (p: Pick) => (
               <div
                 key={p.id}
                 className="rounded-lg border border-neutral-200 p-4"
@@ -212,19 +143,15 @@ export default async function RecommendPage() {
                     <span className="rounded bg-neutral-900 px-2 py-0.5 text-xs text-white">
                       {CATEGORY_LABEL[p.category as Category]}
                     </span>
+                    {seatOf(p) && (
+                      <span className="ml-1 rounded bg-indigo-100 px-1.5 py-0.5 text-xs text-indigo-800">
+                        {GROWTH_ROLE_LABEL[seatOf(p)!]}
+                        {p.weight != null && ` ${pct(p.weight)}%`}
+                      </span>
+                    )}
                     {p.skipped ? (
                       <span className="ml-2 font-semibold text-amber-700">
                         이번 달 건너뜀
-                      </span>
-                    ) : p.sellTicker ? (
-                      <span className="ml-2 font-semibold">
-                        <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-800">
-                          갈아타기
-                        </span>{" "}
-                        <span className="text-red-600">{p.sellTicker}</span> 팔고{" "}
-                        {p.etfName}
-                        <span className="ml-1 text-neutral-400">{p.ticker}</span>{" "}
-                        사기
                       </span>
                     ) : (
                       <>
@@ -239,10 +166,17 @@ export default async function RecommendPage() {
                 </div>
 
                 {p.skipped ? (
-                  <p className="mt-2 text-sm text-amber-700">
-                    잔액 {formatKRW(p.budgetKrw)} 전액이 다음 달로 이월됩니다 (다른
-                    카테고리로 옮기지 않습니다).
-                  </p>
+                  seatOf(p) ? (
+                    <p className="mt-2 text-sm text-amber-700">
+                      이 자리 몫 {formatKRW(p.budgetKrw)}이 {CATEGORY_LABEL[ROLE_CATEGORY]}{" "}
+                      잔액에 남아 다음 회차에 다시 나뉩니다.
+                    </p>
+                  ) : (
+                    <p className="mt-2 text-sm text-amber-700">
+                      잔액 {formatKRW(p.budgetKrw)} 전액이 다음 달로 이월됩니다 (다른
+                      카테고리로 옮기지 않습니다).
+                    </p>
+                  )
                 ) : (
                   <div className="mt-2 space-y-1">
                     <p className="text-sm">
@@ -265,12 +199,6 @@ export default async function RecommendPage() {
                           ? `실시간 ${stampKST(p.pricedAt)} 기준`
                           : "조사 문서 기준"}
                       </span>
-                      {p.refPrice === p.researchPrice &&
-                        p.sellRefPrice !== p.sellResearchPrice && (
-                          <span className="ml-1 text-xs text-neutral-500">
-                            (매도가만 실시간)
-                          </span>
-                        )}
                       {p.priceSource === "realtime" &&
                         p.researchPrice != null &&
                         p.refPrice != null &&
@@ -347,6 +275,14 @@ export default async function RecommendPage() {
                       </span>{" "}
                       이 추천은 이미 매입으로 기록되었습니다.
                     </p>
+                  ) : p.sellTicker ? (
+                    <p className="mt-3 border-t border-neutral-100 pt-3 text-sm text-amber-700">
+                      옛 갈아타기 추천입니다.{" "}
+                      <Link href="/switch" className="underline">
+                        /switch 화면
+                      </Link>
+                      에서 직접 기록하세요.
+                    </p>
                   ) : (
                     <AcceptForm
                       id={p.id}
@@ -354,17 +290,145 @@ export default async function RecommendPage() {
                       // 섞으면 화면 어느 줄과도 맞지 않는 세 번째 조합이 된다
                       defaultQty={nowOf(p) ? nowQtyOf(p) : (p.refQty ?? 0)}
                       defaultPrice={nowOf(p)?.price ?? p.refPrice ?? 0}
-                      sellTicker={p.sellTicker}
-                      sellDefaultQty={p.sellQty}
-                      sellDefaultPrice={
-                        (nowOf(p) && p.sellTicker
-                          ? now.get(p.sellTicker)?.price
-                          : null) ?? p.sellRefPrice
-                      }
                     />
                   ))}
               </div>
-            ))}
+  );
+
+  return (
+    <Page current="/">
+      <h1 className="text-xl font-bold">매입 추천</h1>
+
+      {placeholders.length > 0 && (
+        <Notice kind="warn">
+          아직 자리표시자 프롬프트로 돌아갑니다 (
+          {placeholders.map((s) => (s === "purchase" ? "②" : "③")).join(", ")}).
+          결과 품질을 원하시면{" "}
+          <Link href="/settings" className="underline">
+            설정
+          </Link>
+          에서 직접 쓴 프롬프트를 넣으세요.
+        </Notice>
+      )}
+
+      <Card title="추천 실행">
+        <Runner busyAtLoad={Boolean(running)} />
+        <p className="mt-4 text-sm">
+          이번 회차 활성 카테고리:{" "}
+          <b>{active.map((c) => CATEGORY_LABEL[c]).join("·")}</b>
+          <span className="ml-1 text-xs text-neutral-500">
+            (
+            <Link href="/settings" className="underline">
+              설정
+            </Link>
+            의 월 충전액이 0보다 큰 카테고리. 모두 0이면 세 카테고리 전부.
+            나머지 카테고리 보유 종목은 매수 없이 ④ 보유 점검만 계속합니다)
+          </span>
+        </p>
+        <p className="mt-2 text-xs text-neutral-500">
+          이번에 재조사할 종목 {tickers.length}개
+          {tickers.length > 0 && `: ${tickers.join(", ")}`}
+          {tickers.length === 0 &&
+            " — 조사 문서와 보유 종목이 아직 없어 ②가 조사 대상을 찾지 못합니다. 먼저 정기 조사를 한 번 돌리세요."}
+        </p>
+      </Card>
+
+      <Card title="카테고리별 현재 잔액 = 이번 회차 배정 금액">
+        <div className="grid gap-3 sm:grid-cols-3">
+          {CATEGORIES.map((c) => (
+            <div key={c} className="rounded-lg border border-neutral-200 p-4">
+              <div className="text-sm text-neutral-600">{CATEGORY_LABEL[c]}</div>
+              <div className="mt-1 text-lg font-bold tabular-nums">
+                {formatKRW(balances[c])}
+              </div>
+            </div>
+          ))}
+        </div>
+        <p className="mt-3 text-xs text-neutral-500">
+          추천 에이전트는 이 잔액을 그대로 배정 금액으로 받아 카테고리별로 몇 주를
+          살 수 있는지 계산합니다. 이월된 잔돈이 포함된 값이며, 카테고리 간 이동은
+          없습니다. 가격·수량은 참고치이므로 최종 확인은 증권사 앱에서 하세요.
+        </p>
+      </Card>
+
+      {latest && (
+        <Card
+          title={`추천 결과 (${stampKST(latest.run.finishedAt)})`}
+        >
+          <Notice kind="warn">
+            가격·수량은 추천 시점 실시간가 기준 참고치입니다. 최종 확인과 실제
+            주문은 증권사 앱에서 하세요.
+          </Notice>
+
+          {latest.picks.some((p) => p.category === "high_div" && p.skipped) &&
+            latest.picks.some((p) => !p.skipped) && (
+              <div className="mt-3">
+                <Notice>
+                  고배당을 건너뛰어서 그 잔액이 <b>배당성장·자산성장에 5:3으로
+                  나눠</b> 배정되었습니다. 실제 자금 이동은 매입을 기록할 때
+                  모자란 만큼만 일어나고, 기록하지 않으면 고배당에 그대로
+                  남습니다.
+                </Notice>
+              </div>
+            )}
+
+          <div className="mt-4 space-y-4">
+            {latest.picks.length === 0 && (
+              <p className="text-sm text-neutral-500">
+                추천 항목이 저장되지 않았습니다. 실행 이력에서 로그를 확인하세요.
+              </p>
+            )}
+            {groups.map((g) => {
+              // 자리로 나눠 담는 카테고리는 자산성장뿐이다. 자리 표시가 없는 여러 pick은
+              // 나눠 담은 게 아니므로 묶지 않는다 — 묶으면 소계가 잔액의 배로 읽힌다.
+              const split =
+                g.category === ROLE_CATEGORY &&
+                g.picks.length >= 2 &&
+                g.picks.some((p) => seatOf(p));
+              if (!split) {
+                return (
+                  <Fragment key={g.category}>{g.picks.map(pickCard)}</Fragment>
+                );
+              }
+              // 건너뛴 자리의 budgetKrw는 이월액이라 배정 합계에 더하면 잔액을 넘는다
+              const live = g.picks.filter((p) => !p.skipped);
+              return (
+                <div
+                  key={g.category}
+                  className="space-y-3 rounded-lg border-2 border-neutral-300 p-3"
+                >
+                  <p className="text-sm">
+                    <span className="rounded bg-neutral-900 px-2 py-0.5 text-xs text-white">
+                      {CATEGORY_LABEL[g.category]}
+                    </span>
+                    <b className="ml-2">
+                      {g.picks.length}개 자리로 나눠 담기
+                    </b>
+                  </p>
+                  {g.picks.map(pickCard)}
+                  {live.length > 0 && (
+                    <p className="text-xs text-neutral-500 tabular-nums">
+                      카테고리 소계 — 배정 합계{" "}
+                      <b className="text-neutral-700">
+                        {formatKRW(
+                          live.reduce((sum, p) => sum + p.budgetKrw, 0),
+                        )}
+                      </b>{" "}
+                      ({live
+                        .map(
+                          (p) =>
+                            `${seatOf(p) ? GROWTH_ROLE_LABEL[seatOf(p)!] : "자리 미정"} ${formatKRW(p.budgetKrw)}`,
+                        )
+                        .join(" + ")}
+                      ){" "}
+                      {g.picks.some((p) => accepted.has(p.id))
+                        ? "— 일부를 이미 기록해 현재 잔액은 줄어 있습니다"
+                        : `— 현재 ${CATEGORY_LABEL[g.category]} 잔액 ${formatKRW(balances[g.category])}`}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </Card>
       )}

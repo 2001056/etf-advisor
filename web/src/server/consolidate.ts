@@ -3,9 +3,14 @@ import path from "node:path";
 import { desc, isNull } from "drizzle-orm";
 import { db } from "@/db";
 import { consolidationSuggestions, researchDocs } from "@/db/schema";
-import { getHoldings } from "@/domain/purchases";
+import { getHoldings, holdingRoles } from "@/domain/purchases";
 import { getPrompt } from "@/domain/prompts";
-import { extractJson } from "@/domain/recommendation";
+import {
+  extractJson,
+  GROWTH_ROLE_LABEL,
+  GrowthRole,
+  ROLE_CATEGORY,
+} from "@/domain/recommendation";
 import { CATEGORY_LABEL, CATEGORIES, Category, dateKeyKST } from "@/domain/money";
 import { researchPath } from "./paths";
 import type { WatchDeps } from "./watch";
@@ -69,7 +74,7 @@ export type ConsolidateOutcome = {
   skipped: boolean;
 };
 
-function buildInstruction(
+export function buildInstruction(
   holdings: {
     ticker: string;
     etfName: string;
@@ -78,20 +83,39 @@ function buildInstruction(
     avgPrice: number;
     costKrw: number;
   }[],
+  roles: Map<string, GrowthRole> = new Map(),
 ): string {
+  // 자리 표시가 붙은 종목은 ③이 일부러 나눠 담은 것이다 — 통합 대상이 아니다
+  const seatOf = (h: { category: Category; ticker: string }) =>
+    h.category === ROLE_CATEGORY
+      ? (roles.get(`${h.category}::${h.ticker}`) ?? null)
+      : null;
+  const hasSeat = holdings.some((h) => seatOf(h) !== null);
+
   const byCat = CATEGORIES.map((c) => {
     const hs = holdings.filter((h) => h.category === c);
     if (!hs.length) return null;
     const lines = hs
-      .map(
-        (h) =>
-          `  - ${h.ticker} ${h.etfName} | ${h.qty}주 | 평단가 ${h.avgPrice.toLocaleString("ko-KR")}원 | 원금 ${h.costKrw.toLocaleString("ko-KR")}원`,
-      )
+      .map((h) => {
+        const seat = seatOf(h);
+        // 자리를 아는 종목이 하나도 없으면(③ 이전 매입뿐) 자리 이야기를 꺼내지 않는다
+        const mark =
+          !hasSeat || c !== ROLE_CATEGORY
+            ? ""
+            : seat
+              ? ` | 자리: ${GROWTH_ROLE_LABEL[seat]}`
+              : " | 자리: 확인 불가(자리 도입 전 매입 또는 수기 매입)";
+        return `  - ${h.ticker} ${h.etfName} | ${h.qty}주 | 평단가 ${h.avgPrice.toLocaleString("ko-KR")}원 | 원금 ${h.costKrw.toLocaleString("ko-KR")}원${mark}`;
+      })
       .join("\n");
     return `[${CATEGORY_LABEL[c]}] ${hs.length}종목\n${lines}`;
   })
     .filter(Boolean)
     .join("\n\n");
+
+  const seatRule = hasSeat
+    ? `- ${CATEGORY_LABEL[ROLE_CATEGORY]}은 ${GROWTH_ROLE_LABEL.aggressive} 자리와 ${GROWTH_ROLE_LABEL.stable} 자리로 **일부러 나눠 담은** 것이다. 자리가 서로 다른 두 종목은 통합 대상이 아니다. 같은 자리 안에 종목이 여러 개 쌓였을 때만 검토하고, 자리가 "확인 불가"인 종목은 판단을 보류하고 그 사실을 적어라.\n`
+    : "";
 
   return `
 ────────────────────────────────
@@ -100,7 +124,7 @@ ${byCat}
 
 [검토 규칙]
 - **종목이 2개 이상인 카테고리만** 검토한다. 1개뿐이면 그 카테고리는 제안하지 마라.
-- 같은 카테고리 안에서 **실질적으로 같은 것을 사고 있는지** 본다.
+${seatRule}- 같은 카테고리 안에서 **실질적으로 같은 것을 사고 있는지** 본다.
   기초지수가 같거나 거의 같은지, 상위 편입 종목이 크게 겹치는지, 최근 수익률이 나란히 움직이는지.
 - 겹침이 크지 않으면(예: 서로 다른 지수·다른 전략) **통합을 제안하지 마라.** 그건 정상적인 분산이다.
 - 통합을 제안한다면 keep_ticker에 **남길 종목 하나**를 고르고, 왜 그쪽인지 적어라
@@ -113,6 +137,23 @@ ${byCat}
 - 검토할 게 없으면 suggestions를 빈 배열로 두고 끝내라. 억지로 만들지 마라.
 
 반드시 지정된 JSON 스키마로만 응답하라.`.trim();
+}
+
+/**
+ * 검토할 카테고리가 있는지. 2종목 이상이어야 하고,
+ * 자산성장이 서로 다른 자리 하나씩으로만 차 있으면 그건 일부러 나눠 담은 것이라 검토 대상이 아니다.
+ */
+export function needsReview(
+  holdings: { category: Category; ticker: string }[],
+  roles: Map<string, GrowthRole> = new Map(),
+): boolean {
+  return CATEGORIES.some((c) => {
+    const hs = holdings.filter((h) => h.category === c);
+    if (hs.length < 2) return false;
+    if (c !== ROLE_CATEGORY) return true;
+    const seats = hs.map((h) => roles.get(`${c}::${h.ticker}`) ?? null);
+    return seats.some((s) => s === null) || new Set(seats).size !== seats.length;
+  });
 }
 
 export function normalizeSuggestions(
@@ -180,13 +221,10 @@ export async function runConsolidateReview(
   deps: WatchDeps,
   trigger: "schedule" | "user" = "schedule",
 ): Promise<ConsolidateOutcome> {
-  const holdings = await getHoldings();
+  const [holdings, roles] = await Promise.all([getHoldings(), holdingRoles()]);
 
-  // 카테고리마다 2종목 이상인 곳이 하나도 없으면 부를 이유가 없다
-  const hasMulti = CATEGORIES.some(
-    (c) => holdings.filter((h) => h.category === c).length >= 2,
-  );
-  if (!hasMulti) {
+  // 검토할 카테고리가 하나도 없으면 부를 이유가 없다
+  if (!needsReview(holdings, roles)) {
     return { runId: 0, docId: null, suggestions: 0, skipped: true };
   }
 
@@ -202,7 +240,7 @@ export async function runConsolidateReview(
 
     const dateKey = dateKeyKST();
     const { body } = await getPrompt("consolidate");
-    const prompt = [body, buildInstruction(holdings)].join("\n\n");
+    const prompt = [body, buildInstruction(holdings, roles)].join("\n\n");
 
     const res = await deps.run({
       runId: run.id,

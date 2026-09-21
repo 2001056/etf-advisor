@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   boolean,
   date,
+  doublePrecision,
   integer,
   jsonb,
   pgEnum,
@@ -118,6 +119,11 @@ export const recommendations = pgTable("recommendations", {
     .defaultNow(),
   month: text("month").notNull(), // YYYY-MM
   category: categoryEnum("category").notNull(),
+  // 자산성장을 나눠 담은 자리('aggressive' | 'stable'). 자리를 두지 않는 카테고리는 NULL.
+  // 매입(purchases.recommendation_id)을 거슬러 올라가면 보유 종목이 어느 자리인지 알 수 있다.
+  role: text("role"),
+  // 두 자리를 다 채웠을 때 그 자리에 준 비중(합 1). 한 종목으로 끝나면 NULL
+  weight: doublePrecision("weight"),
   // 건너뜀(skipped)일 때는 종목이 없다 — 지어내지 않도록 nullable
   ticker: text("ticker"),
   etfName: text("etf_name"),
