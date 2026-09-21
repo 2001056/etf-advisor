@@ -1258,7 +1258,7 @@ const fmtBase = {
   runId: 7,
   tickers: ["446720", "133690"],
 };
-check("대조군: 지정 없음(④ 경로) = HEAD", buildFormatInstruction(fmtBase) === HEAD_FORMAT_ONDEMAND, true);
+check("대조군: 카테고리 지정 없음 = HEAD", buildFormatInstruction(fmtBase) === HEAD_FORMAT_ONDEMAND, true);
 check("대조군: 세 개 지정 = HEAD", buildFormatInstruction({ ...fmtBase, categories: ALL }) === HEAD_FORMAT_ONDEMAND, true);
 const fmtAsset = buildFormatInstruction({ ...fmtBase, categories: ["asset_growth"] });
 check(
@@ -1294,7 +1294,7 @@ console.log("\n=== [자리 정의]는 자산성장이 보이는 문서에만 붙
 const seatDefLine = "[자리 정의] 공격적 성장: 변동이 크더라도 장기 기대 수익이 높은 성장 지수 / 안정적 성장: 여러 업종에 분산하여 특정 업종·종목 의존도를 낮추는 주식 지수";
 check("세 개 활성", buildFormatInstruction({ ...fmtBase, categories: ALL }).includes(seatDefLine), true);
 check("자산성장만", fmtAsset.includes(seatDefLine), true);
-check("지정 없음(④ 경로)", buildFormatInstruction(fmtBase).includes(seatDefLine), true);
+check("카테고리 지정 없음", buildFormatInstruction(fmtBase).includes(seatDefLine), true);
 check("note 규칙도 함께", fmtAsset.includes('자리를 정할 수 없으면 "미정"으로 두고'), true);
 check("자산성장 밖 행에는 적지 않는다", fmtAsset.includes("자산성장이 아닌 카테고리로 분류한 행에는 자리를 적지 않는다"), true);
 check(

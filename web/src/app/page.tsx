@@ -168,7 +168,9 @@ export default async function DashboardPage() {
                   className={`rounded-lg border p-4 ${
                     a.severity === "danger"
                       ? "border-red-300 bg-red-50"
-                      : "border-amber-300 bg-amber-50"
+                      : a.severity === "unknown"
+                        ? "border-neutral-300 bg-neutral-50"
+                        : "border-amber-300 bg-amber-50"
                   }`}
                 >
                   <div className="flex flex-wrap items-center gap-2">
@@ -176,10 +178,16 @@ export default async function DashboardPage() {
                       className={`rounded px-2 py-0.5 text-xs font-medium ${
                         a.severity === "danger"
                           ? "bg-red-600 text-white"
-                          : "bg-amber-500 text-white"
+                          : a.severity === "unknown"
+                            ? "bg-neutral-500 text-white"
+                            : "bg-amber-500 text-white"
                       }`}
                     >
-                      {a.severity === "danger" ? "위험" : "주의"}
+                      {a.severity === "danger"
+                        ? "위험"
+                        : a.severity === "unknown"
+                          ? "확인 불가"
+                          : "주의"}
                     </span>
                     <span className="font-semibold">{a.etfName}</span>
                     <span className="text-neutral-500">{a.ticker}</span>

@@ -1,9 +1,8 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { desc, isNull } from "drizzle-orm";
+import { isNull, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { holdingAlerts, researchDocs } from "@/db/schema";
-import { buildFormatInstruction } from "@/domain/docFormat";
 import { getMonthlyTopup } from "@/domain/ledger";
 import { getHoldings, holdingRoles } from "@/domain/purchases";
 import { getPrompt } from "@/domain/prompts";
@@ -25,6 +24,9 @@ import { researchPath } from "./paths";
  * - 결과는 `holding_alerts`에 남고, 대시보드가 그것만 읽는다
  *
  * 매도까지 제안한다 — ③은 "앞으로 살 것"만 정하고, 팔지 말지는 여기서 본다.
+ *
+ * 모델이 내놓는 것은 `ALERT_SCHEMA` JSON 하나뿐이다. 조사 문서 형식 지시문
+ * (`buildFormatInstruction`)은 붙이지 않는다 — 문서 md는 아래에서 시스템이 판정으로 만든다.
  */
 
 const ALERT_SCHEMA = {
@@ -39,7 +41,10 @@ const ALERT_SCHEMA = {
         properties: {
           ticker: { type: "string" },
           etf_name: { type: "string" },
-          severity: { type: "string", enum: ["info", "warn", "danger"] },
+          severity: {
+            type: "string",
+            enum: ["info", "warn", "danger", "unknown"],
+          },
           action: {
             type: "string",
             enum: ["hold", "stop_buying", "sell"],
@@ -67,7 +72,7 @@ const ALERT_SCHEMA = {
   required: ["alerts"],
 } as const;
 
-const SEVERITY = new Set(["info", "warn", "danger"]);
+const SEVERITY = new Set(["info", "warn", "danger", "unknown"]);
 const ACTION = new Set(["hold", "stop_buying", "sell"]);
 
 /**
@@ -109,8 +114,11 @@ ${lines}
 
 [판정 규칙]
 - 종목마다 정확히 하나씩 판정을 낸다. 빠뜨리지 마라.
-- severity: info(문제 없음) / warn(지켜볼 것) / danger(지금 조치 필요)
+- severity: info(문제 없음) / warn(지켜볼 것) / danger(지금 조치 필요) /
+  unknown(판정에 필요한 핵심 자료를 확인하지 못함 — **문제 없음이 아니다**)
 - action: hold(그대로 둔다) / stop_buying(신규 매수만 중단) / sell(팔고 갈아탄다)
+- **severity=unknown이면 action은 반드시 hold다.** 확인하지 못한 것을 근거로 매도·매수중단을 권하지 마라.
+  replacement는 둘 다 null로 두고, 무엇을 확인하지 못했는지 issue에 적어라.
 - **action=sell은 근거가 분명할 때만 써라.** 단기 가격 하락은 매도 사유가 아니다.
   상장폐지·거래정지, 운용전략의 중대한 변경, 분배 재원이 원금을 깎고 있다는 확인된 신호,
   순자산 급감으로 유동성이 위험한 경우처럼 구조적 문제일 때만 해당한다.
@@ -125,9 +133,22 @@ ${lines}
 - rationale에는 판정 근거를 수치와 함께 적는다. 추측이면 추측이라고 밝혀라.
 - source_urls에는 그 판정을 뒷받침하는 실제 URL만 넣는다.
 - 매도는 되돌리기 어려운 행동이고 매도 손익은 계좌 정산에 반영된다(즉시 과세는 아니다). 재매수 비용도 든다.
-  자료가 부족해 판단이 서지 않으면 위험 판정 대신 "확인 불가"로 남기고 hold로 둬라.
+  자료가 부족해 판단이 서지 않으면 위험 판정 대신 severity=unknown("확인 불가")으로 남기고 hold로 둬라.
+- 출력은 JSON 하나뿐이며 마크다운 보고서를 쓰지 않는다.
 
 반드시 지정된 JSON 스키마로만 응답하라.`.trim();
+}
+
+/**
+ * ④ 프롬프트 조립 — 프롬프트 본문 + 판정 계약.
+ * 조사 문서 형식 지시문은 붙지 않는다: ④의 출력 계약은 JSON 하나뿐이다.
+ */
+export function buildWatchPrompt(
+  body: string,
+  holdings: Parameters<typeof buildAlertInstruction>[0],
+  opts: Parameters<typeof buildAlertInstruction>[1] = {},
+): string {
+  return [body, buildAlertInstruction(holdings, opts)].join("\n\n");
 }
 
 /** 모델 출력에서 유효한 경고만 골라낸다 */
@@ -172,15 +193,26 @@ export function normalizeAlerts(
     const rt = String(a.replacement_ticker ?? "").replace(/[^0-9A-Za-z]/g, "");
     // 적립을 멈춘 카테고리는 이번 회차 재원이 없다 — 갈아탈 곳을 시스템이 권하지 않는다
     const inactive = active ? !active.includes(held.category) : false;
-    const keepReplacement = isSell && Boolean(rt) && !inactive;
+    // "확인 불가"는 위험을 확인한 게 아니다 — 확인하지 못한 것을 근거로 팔게 두지 않는다
+    const unknown = severity === "unknown";
+    const keepReplacement = isSell && Boolean(rt) && !inactive && !unknown;
     if (isSell && rt && inactive) {
       dropped.push(`적립 중단 카테고리라 대체 종목 제외: ${ticker}`);
     }
+    if (isSell && rt && unknown) {
+      dropped.push(`확인 불가(severity=unknown) 판정이라 대체 종목 제외: ${ticker}`);
+    }
     // 재원도 대체 종목도 없는 카테고리에 매도·매수중단을 권하면 사람이 따를 길이 없다.
     // 위험 판정(severity)은 그대로 두고 조치만 hold로 내린다 — 팔지 말지는 사람이 정한다.
-    const forcedHold = inactive && action !== "hold";
-    if (forcedHold) {
+    const forcedHoldInactive = inactive && action !== "hold";
+    if (forcedHoldInactive) {
       dropped.push(`적립 중단 카테고리라 action=${action} → hold 고정: ${ticker}`);
+    }
+    const forcedHoldUnknown = unknown && action !== "hold";
+    if (forcedHoldUnknown) {
+      dropped.push(
+        `확인 불가(severity=unknown)라 action=${action} → hold 고정: ${ticker}`,
+      );
     }
     const issue = String(a.issue ?? "").slice(0, 500) || "이상 없음";
 
@@ -188,9 +220,13 @@ export function normalizeAlerts(
       ticker,
       etfName: held.etfName,
       category: held.category,
-      severity: severity as "info" | "warn" | "danger",
-      action: (forcedHold ? "hold" : action) as "hold" | "stop_buying" | "sell",
-      issue: forcedHold ? `${FORCED_HOLD_PREFIX}${issue}` : issue,
+      severity: severity as "info" | "warn" | "danger" | "unknown",
+      action: (forcedHoldInactive || forcedHoldUnknown ? "hold" : action) as
+        | "hold"
+        | "stop_buying"
+        | "sell",
+      // 접두는 적립 중단 고정에만 붙인다 — unknown은 화면에 "확인 불가" 뱃지로 그대로 읽힌다
+      issue: forcedHoldInactive ? `${FORCED_HOLD_PREFIX}${issue}` : issue,
       replacementTicker: keepReplacement ? rt : null,
       replacementName: keepReplacement
         ? String(a.replacement_name ?? "") || null
@@ -203,6 +239,14 @@ export function normalizeAlerts(
   }
 
   return { rows, dropped };
+}
+
+/**
+ * 맥 알림을 띄울 판정 — danger 만.
+ * unknown(확인 불가)은 위험을 확인한 게 아니므로 알리지 않는다. 대시보드에는 그대로 남는다.
+ */
+export function alertsToNotify<T extends { severity: string }>(rows: T[]): T[] {
+  return rows.filter((r) => r.severity === "danger");
 }
 
 export type WatchDeps = {
@@ -256,16 +300,7 @@ export async function runHoldingWatch(
 
     const dateKey = dateKeyKST();
     const { body } = await getPrompt("watch");
-    const prompt = [
-      body,
-      buildFormatInstruction({
-        type: "watch",
-        dateKey,
-        runId: run.id,
-        tickers: holdings.map((h) => h.ticker),
-      }),
-      buildAlertInstruction(holdings, { roles, active }),
-    ].join("\n\n");
+    const prompt = buildWatchPrompt(body, holdings, { roles, active });
 
     const res = await deps.run({
       runId: run.id,
@@ -334,7 +369,8 @@ export async function runHoldingWatch(
         .values(rows.map((r) => ({ ...r, runId: run.id, docId: doc.id })));
     }
 
-    const danger = rows.filter((r) => r.severity === "danger").length;
+    const notifiable = alertsToNotify(rows);
+    const danger = notifiable.length;
     await deps.finish(
       run.id,
       "done",
@@ -346,10 +382,7 @@ export async function runHoldingWatch(
     );
 
     if (danger > 0) {
-      const names = rows
-        .filter((r) => r.severity === "danger")
-        .map((r) => r.etfName)
-        .join(", ");
+      const names = notifiable.map((r) => r.etfName).join(", ");
       await deps.notify("보유 종목 위험", `${names} — 사이트에서 확인하세요.`);
     }
 
@@ -366,11 +399,17 @@ export async function runHoldingWatch(
   }
 }
 
-/** 지금 열려 있는 경고 */
+/**
+ * 지금 열려 있는 경고. 급한 것부터 보여준다 — danger > warn > unknown > info.
+ * enum 선언 순서(unknown이 맨 뒤)를 그대로 쓰면 "확인 불가"가 "위험" 위로 올라오므로 여기서 정한다.
+ */
+const SEVERITY_RANK = sql`case ${holdingAlerts.severity}
+  when 'danger' then 0 when 'warn' then 1 when 'unknown' then 2 else 3 end`;
+
 export async function openAlerts() {
   return db
     .select()
     .from(holdingAlerts)
     .where(isNull(holdingAlerts.resolvedAt))
-    .orderBy(desc(holdingAlerts.severity), holdingAlerts.ticker);
+    .orderBy(SEVERITY_RANK, holdingAlerts.ticker);
 }

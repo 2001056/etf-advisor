@@ -82,9 +82,12 @@ const EXAMPLE_ROW: Record<Category, string> = {
     "| 161510 | PLUS 고배당주 | 고배당 | 12345 | 6.2 | 12.4 | flat | trailing12m | 0.1 | 비고 |",
 };
 
-/** 프롬프트 뒤에 붙는 출력 형식 지시문. */
+/**
+ * 프롬프트 뒤에 붙는 출력 형식 지시문 — 조사 문서(①·②)에만 붙는다.
+ * ④·⑤는 마크다운 문서가 아니라 JSON으로 답하므로 이 지시문을 받지 않는다.
+ */
 export function buildFormatInstruction(opts: {
-  type: "scheduled" | "ondemand" | "watch";
+  type: "scheduled" | "ondemand";
   dateKey: string;
   runId: number;
   tickers?: string[];

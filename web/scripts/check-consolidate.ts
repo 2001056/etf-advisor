@@ -62,6 +62,28 @@ check("빈 배열", normalizeSuggestions({ suggestions: [] }, HOLD).rows.length 
 check("null", normalizeSuggestions(null, HOLD).rows.length === 0);
 check("배열만 와도 처리", normalizeSuggestions([s({})], HOLD).rows.length === 1);
 
+console.log("\n=== 검토 메모(notes)는 제안이 없어도 남는다 ===");
+const notesOnly = normalizeSuggestions(
+  { suggestions: [], notes: ["배당성장: 기초지수가 서로 달라 통합 대상 아님", "자산성장: 자리가 달라 검토 제외"] },
+  HOLD,
+);
+check("제안은 0건", notesOnly.rows.length === 0);
+check("메모 2줄 보존", notesOnly.notes.length === 2);
+check("  첫 줄 그대로", notesOnly.notes[0] === "배당성장: 기초지수가 서로 달라 통합 대상 아님");
+const dirtyNotes = normalizeSuggestions(
+  { suggestions: [s({})], notes: ["살아남는 메모", 5, null, { a: 1 }, "   ", "  공백은 다듬는다  "] },
+  HOLD,
+);
+check("비문자열 제거", dirtyNotes.notes.length === 2);
+check("  빈 문자열도 제거", !dirtyNotes.notes.includes(""));
+check("  앞뒤 공백 정리", dirtyNotes.notes[1] === "공백은 다듬는다");
+check("  제안은 그대로 살아남는다", dirtyNotes.rows.length === 1);
+check("대조군: notes 가 없으면 빈 배열", normalizeSuggestions({ suggestions: [s({})] }, HOLD).notes.length === 0);
+check("대조군: notes 가 배열이 아니면 빈 배열",
+  normalizeSuggestions({ suggestions: [], notes: "한 줄짜리 문자열" }, HOLD).notes.length === 0);
+check("대조군: 배열만 와도 터지지 않는다", normalizeSuggestions([s({})], HOLD).notes.length === 0);
+check("대조군: null 도 빈 배열", normalizeSuggestions(null, HOLD).notes.length === 0);
+
 console.log("\n=== 비용 안내는 반드시 남는다 ===");
 check("cost_note 보존", normalizeSuggestions({ suggestions: [s({ cost_note: "ISA 비과세 한도 소진" })] }, HOLD).rows[0].costNote.includes("ISA"));
 
@@ -81,6 +103,13 @@ check("공격 자리 표시", withSeats.includes("133690 공격 합성 ETF | 10�
 check("안정 자리 표시", withSeats.includes("379800 안정 합성 ETF | 10주 | 평단가 22,000원 | 원금 220,000원 | 자리: 안정적 성장"));
 check("자리가 다르면 통합 대상 아님 규칙", withSeats.includes("자리가 서로 다른 두 종목은 통합 대상이 아니다"));
 
+console.log("\n=== 겹침이 작다는 말과 분산 효과를 섞지 않는다 ===");
+check("통합 대상이 아니라고만 말한다",
+  withSeats.includes("통합 대상이 아니다(분산 효과는 별도로 판단한다)"));
+check("'그건 정상적인 분산이다' 는 없다", !withSeats.includes("그건 정상적인 분산이다"));
+check("notes 규칙이 들어 있다",
+  withSeats.includes("suggestions가 비어 있어도 notes는 남긴다"));
+
 const partialSeats = buildInstruction(
   seatHoldings,
   new Map<string, GrowthRole>([["asset_growth::133690", "aggressive"]]),
@@ -91,7 +120,7 @@ check("  보류 규칙 문구", partialSeats.includes('자리가 "확인 불가"
 console.log("\n=== 대조군: 자리 정보가 없으면 지시문이 예전과 같다 ===");
 const noSeats = buildInstruction(seatHoldings);
 check("자리 표시 없음", !noSeats.includes("자리:"));
-check("자리 규칙도 없음", !noSeats.includes("통합 대상이 아니다"));
+check("자리 규칙도 없음", !noSeats.includes("자리가 서로 다른 두 종목은 통합 대상이 아니다"));
 check("보유 줄은 예전 형식", noSeats.includes("133690 공격 합성 ETF | 10주 | 평단가 21,000원 | 원금 210,000원\n"));
 check(
   "배당성장 보유에는 자리 표시가 붙지 않는다",

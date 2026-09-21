@@ -151,6 +151,10 @@ export const alertSeverityEnum = pgEnum("alert_severity", [
   "info",
   "warn",
   "danger",
+  // 판정에 필요한 핵심 자료를 확인하지 못함 — "문제 없음"이 아니다. action은 hold로 고정된다.
+  // 값을 뒤에 붙이는 것은 ALTER TYPE ADD VALUE 로 끝나기 때문이다.
+  // 표시 순서는 선언 순서가 아니라 openAlerts 의 SEVERITY_RANK 가 정한다.
+  "unknown",
 ]);
 
 export const alertActionEnum = pgEnum("alert_action", [

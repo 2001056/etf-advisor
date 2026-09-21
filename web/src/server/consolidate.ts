@@ -56,8 +56,13 @@ const CONSOLIDATE_SCHEMA = {
         ],
       },
     },
+    /**
+     * 정리를 제안하지 않은 이유·판단을 보류한 이유. 카테고리마다 한 줄.
+     * suggestions가 비어도 "왜 비었는지"는 남아야 사람이 읽을 게 있다.
+     */
+    notes: { type: "array", items: { type: "string" } },
   },
-  required: ["suggestions"],
+  required: ["suggestions", "notes"],
 } as const;
 
 const KO_TO_CATEGORY: Record<string, Category> = {
@@ -126,7 +131,7 @@ ${byCat}
 - **종목이 2개 이상인 카테고리만** 검토한다. 1개뿐이면 그 카테고리는 제안하지 마라.
 ${seatRule}- 같은 카테고리 안에서 **실질적으로 같은 것을 사고 있는지** 본다.
   기초지수가 같거나 거의 같은지, 상위 편입 종목이 크게 겹치는지, 최근 수익률이 나란히 움직이는지.
-- 겹침이 크지 않으면(예: 서로 다른 지수·다른 전략) **통합을 제안하지 마라.** 그건 정상적인 분산이다.
+- 겹침이 크지 않으면(예: 서로 다른 지수·다른 전략) **통합을 제안하지 마라.** 통합 대상이 아니다(분산 효과는 별도로 판단한다).
 - 통합을 제안한다면 keep_ticker에 **남길 종목 하나**를 고르고, 왜 그쪽인지 적어라
   (비용, 추적 품질, 유동성, 순자산 규모 기준).
 - cost_note에는 **지금 옮기면 생기는 비용**을 반드시 적어라 — 매도에 따른 실현손익,
@@ -135,6 +140,9 @@ ${seatRule}- 같은 카테고리 안에서 **실질적으로 같은 것을 사�
   적립을 계속하면 자연히 한쪽으로 쏠릴 수 있으므로, 굳이 팔 필요 없이 신규 매수만
   한쪽으로 모으는 선택지도 함께 제시하라.
 - 검토할 게 없으면 suggestions를 빈 배열로 두고 끝내라. 억지로 만들지 마라.
+- notes에는 **정리를 제안하지 않은 이유와 판단을 보류한 이유**를 검토한 카테고리마다 한 줄씩 적어라
+  (무엇이 어떻게 달라서 통합 대상이 아닌지, 또는 무엇을 확인하지 못해 보류했는지).
+  suggestions가 비어 있어도 notes는 남긴다. 적을 것이 정말 없으면 빈 배열로 둔다.
 
 반드시 지정된 JSON 스키마로만 응답하라.`.trim();
 }
@@ -161,11 +169,20 @@ export function normalizeSuggestions(
   holdings: { ticker: string; category: Category }[],
 ): {
   rows: Omit<typeof consolidationSuggestions.$inferInsert, "runId" | "docId">[];
+  /** 정리 불필요·판단 보류 사유. 제안이 하나도 없어도 남는다 */
+  notes: string[];
   dropped: string[];
 } {
   const list = Array.isArray(raw)
     ? raw
     : ((raw as { suggestions?: unknown[] } | null)?.suggestions ?? []);
+  const rawNotes = Array.isArray(raw)
+    ? []
+    : ((raw as { notes?: unknown } | null)?.notes ?? []);
+  const notes = (Array.isArray(rawNotes) ? rawNotes : [])
+    .filter((n): n is string => typeof n === "string")
+    .map((n) => n.trim())
+    .filter(Boolean);
   const held = new Map(holdings.map((h) => [h.ticker, h.category]));
   const dropped: string[] = [];
   const rows: Omit<
@@ -214,7 +231,7 @@ export function normalizeSuggestions(
     });
   }
 
-  return { rows, dropped };
+  return { rows, notes, dropped };
 }
 
 export async function runConsolidateReview(
@@ -261,7 +278,7 @@ export async function runConsolidateReview(
       return { runId: run.id, docId: null, suggestions: 0, skipped: false };
     }
 
-    const { rows, dropped } = normalizeSuggestions(
+    const { rows, notes, dropped } = normalizeSuggestions(
       extractJson(res.output),
       holdings,
     );
@@ -280,6 +297,10 @@ export async function runConsolidateReview(
             )
             .join("\n\n")
         : "정리할 만한 중복이 없습니다.",
+      // 제안이 없을 때 "왜 없는지"가 유일하게 남는 기록이다
+      ...(notes.length
+        ? ["", "## 검토 메모", "", ...notes.map((n) => `- ${n}`)]
+        : []),
     ].join("\n");
 
     const filePath = researchPath(dateKey, "consolidate", run.id);
