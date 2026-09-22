@@ -1,5 +1,5 @@
 import { CATEGORIES, CATEGORY_LABEL, Category } from "./money";
-import { ParsedDoc, tickersOf } from "./docFormat";
+import { DataRow, ParsedDoc, isNoValueMark, tickersOf } from "./docFormat";
 
 /**
  * ③ 추천 에이전트의 JSON 출력을 DB 행으로 바꾸는 순수 로직.
@@ -203,6 +203,154 @@ export function realtimePriceBlock(
   ].join("\n");
 }
 
+/**
+ * ③ 핵심 자료 게이트가 보는 ② 표의 열. 프롬프트의 "핵심 항목 4개"와 짝이 맞아야 한다.
+ * `mdd_1y_pct`(하락 위험)와 추적오차는 여기 없다 — 확인 못 해도 매수를 막지 않고 경고만 남긴다.
+ */
+export const CORE_EVIDENCE_FIELDS = [
+  ["costPct", "실부담비용"],
+  ["aumBn", "순자산총액"],
+  ["turnoverBn", "거래대금"],
+  ["totalReturn1y", "1년 총수익률"],
+] as const;
+
+/**
+ * 장기 총수익 항목은 숫자 하나로 확인된 것이 아니다 — 그 숫자가 어느 기간을 잰 값인지
+ * (`return_basis`: 1y / since_listing:N)까지 있어야 다른 후보와 비교할 수 있다.
+ * 열이 없던 옛 문서는 빈 문자열이라 여기서 걸린다(이미 다른 열로도 걸린다).
+ */
+export const RETURN_BASIS_LABEL = "수익률 기간 기준";
+
+/**
+ * 순수 매수 pick 하나를 ② 문서의 그 종목 행과 대조한다.
+ * 핵심 4항목 중 하나라도 비어 있으면 건너뜀 사유 문자열을, 통과하면 null을 준다.
+ *
+ * 전에는 "핵심 4항목이 확인되지 않은 후보는 고르지 마라"가 ③ 프롬프트 문구뿐이라
+ * 모델이 어기면 그대로 통과했다. 표에 열을 만들고 여기서 기계로 막는다.
+ */
+export function gateCoreEvidence(
+  pick: { ticker: string | null; skipped: boolean },
+  row: DataRow | null | undefined,
+): string | null {
+  if (pick.skipped || !pick.ticker) return null;
+  if (!row) return `핵심 자료 미확인(②): ② 문서 데이터 표에 ${pick.ticker} 행이 없음`;
+
+  const missing: string[] = CORE_EVIDENCE_FIELDS.filter(
+    ([field]) => !num(row[field]),
+  ).map(([, label]) => label);
+  // 기간 기준이 없으면 total_return_1y 숫자가 무엇을 잰 값인지 알 수 없다
+  if (isNoValueMark(row.returnBasis)) missing.push(RETURN_BASIS_LABEL);
+  if (!missing.length) return null;
+
+  // 그 열 자체가 없던 문서와, 열은 있는데 모델이 NA로 둔 문서를 사유에서 구분한다
+  const legacy = row.hasEvidenceColumns ? "" : " (구 형식 문서 — 핵심 증거 열이 없음)";
+  return `핵심 자료 미확인(②): ${missing.join("·")}${legacy}`;
+}
+
+function num(v: number | null | undefined): v is number {
+  return v !== null && v !== undefined && Number.isFinite(v);
+}
+
+/**
+ * ④가 신규 매수를 막은 티커를 ③ 프롬프트에 알리는 블록.
+ * 미해결(resolved_at null) 경고 중 action이 stop_buying·sell인 것만 온다.
+ */
+export function stopBuyingBlock(
+  alerts: { ticker: string; action: string; issue: string }[],
+): string {
+  const blocked = alerts.filter(
+    (a) => a.action === "stop_buying" || a.action === "sell",
+  );
+  if (!blocked.length) return "";
+  const items = blocked
+    .map(
+      (a) =>
+        `${a.ticker}(${a.action === "sell" ? "매도 권고" : "신규 매수 중단"} — ${a.issue.trim() || "사유 없음"})`,
+    )
+    .join(", ");
+  return [
+    `[보유 점검 경고 — 신규 매수 제외: ${items}]`,
+    "위 티커는 ④ 보유 점검이 아직 해소되지 않은 경고를 남긴 종목이다. 이번 회차 신규 매수 후보로 고르지 마라.",
+  ].join("\n");
+}
+
+/** ③ 정규화에 넘길 "신규 매수 금지" 목록 — 티커 → 사유 */
+export function blockedBuyTickers(
+  alerts: { ticker: string; action: string; issue: string }[],
+): Map<string, string> {
+  return new Map(
+    alerts
+      .filter((a) => a.action === "stop_buying" || a.action === "sell")
+      .map((a) => [
+        a.ticker,
+        `${a.action === "sell" ? "매도 권고" : "신규 매수 중단"} — ${a.issue.trim() || "사유 없음"}`,
+      ]),
+  );
+}
+
+/**
+ * 건너뜀 사유 분류 — 실행 노트의 집계에만 쓴다.
+ * 사유 문자열은 정규화·실시간가 적용부가 rationale에 남긴 문구다.
+ */
+const SKIP_REASON_RULES: [RegExp, string][] = [
+  [/핵심 자료 미확인\(②\)/, "핵심 자료 미확인(②)"],
+  [/신규 매수 제외\(④ 보유 점검\)/, "④ 보유 점검 경고"],
+  [/조사가와 30% 넘게 차이/, "실시간가 드리프트"],
+  [/실시간가 없음/, "실시간가 없음"],
+  [/1주도 못 산다/, "1주 매수 불가"],
+  [/자리 비움|모델이 이 자리를 내지 않음/, "빈 자리"],
+  [/매수 대상이 아닌 카테고리/, "비활성 카테고리"],
+];
+
+/**
+ * "건너뜀 N/M 자리 (사유별 집계)" 한 줄.
+ * 두 회차 연속 건너뜀률이 높으면 게이트가 과한 것이므로 사람이 완화를 검토한다(docs/운영.md).
+ */
+export function skipTally(
+  rows: { skipped: boolean; rationale: string }[],
+): string {
+  if (!rows.length) return "";
+  const skipped = rows.filter((r) => r.skipped);
+  const counts = new Map<string, number>();
+  for (const r of skipped) {
+    const label =
+      SKIP_REASON_RULES.find(([re]) => re.test(r.rationale))?.[1] ??
+      "모델 판단(skip)";
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const detail = [...counts]
+    .map(([label, n]) => `${label} ${n}`)
+    .join(", ");
+  return (
+    `건너뜀 ${skipped.length}/${rows.length} 자리` +
+    (detail ? ` (${detail})` : "")
+  );
+}
+
+/**
+ * ①이 이전 문서를 받지 않으므로 관찰 목록이 회차마다 통째로 바뀔 수 있다.
+ * 최신 ① 문서의 데이터 표(활성 카테고리 행)를 "직전 관찰 목록"으로 되돌려 넣는다.
+ */
+export function priorWatchlistBlock(
+  doc: ParsedDoc | null,
+  active: Category[],
+): string {
+  const rows = (doc?.dataRows ?? []).filter((r) =>
+    active.includes(CATEGORY_FROM_KO[r.category.trim()]),
+  );
+  if (!rows.length) return "";
+  const lines = rows.map((r) => {
+    const note = r.note.trim();
+    const head = note.length > 60 ? `${note.slice(0, 60)}…` : note;
+    return `- ${CATEGORY_LABEL[CATEGORY_FROM_KO[r.category.trim()]]} | ${r.ticker} ${r.name} | ${head || "(note 없음)"}`;
+  });
+  return [
+    "[직전 관찰 목록 — 지난 정기 조사 문서의 데이터 표]",
+    "여기 있는 종목이 이번 회차의 '기존 대표 상품'이다. 자리 표기와 비고는 그 문서에 적혀 있던 값이다.",
+    ...lines,
+  ].join("\n");
+}
+
 export function recommendOutputRules(active: Category[]): string[] {
   const labels = active.map((c) => CATEGORY_LABEL[c]).join("·");
   // 자산성장은 두 자리를 쓰므로 "각각 한 번씩, 총 N개"가 성립하지 않는다.
@@ -382,6 +530,13 @@ export function normalizePicks(
     roleWeights?: Record<GrowthRole, number>;
     /** ② 최신 문서 데이터 표의 티커→price. researchPrice에 채워 ② 오파싱 탐지의 기준이 된다 */
     researchPrices?: Map<string, number>;
+    /**
+     * ② 최신 문서 데이터 표의 티커→행 전체. 주면 핵심 자료 게이트(`gateCoreEvidence`)가 돈다.
+     * 안 주면 게이트를 돌리지 않는다 — 옛 호출부와 대조군을 그대로 두기 위해서다.
+     */
+    researchRows?: Map<string, DataRow>;
+    /** ④가 신규 매수를 막은 티커 → 사유 (`blockedBuyTickers`) */
+    blockedTickers?: Map<string, string>;
   },
 ): NormalizeResult {
   const list = Array.isArray(raw)
@@ -424,7 +579,27 @@ export function normalizePicks(
     const action = String(p.action ?? "").trim();
     const explicitSkip = action === "skip";
     const inactive = ctx.active ? !ctx.active.includes(category) : false;
-    const skipped = explicitSkip || inactive || !ticker || price === null;
+    const preSkipped = explicitSkip || inactive || !ticker || price === null;
+
+    // ④가 아직 해소되지 않은 매수 중단·매도 경고를 남긴 종목은 신규 매수 대상이 아니다
+    const blockedReason = preSkipped
+      ? null
+      : (ctx.blockedTickers?.get(ticker) ?? null);
+    // ② 표에서 핵심 4항목을 확인하지 못한 후보는 고를 수 없다 (프롬프트가 아니라 코드가 막는다)
+    const gateReason =
+      preSkipped || blockedReason
+        ? null
+        : ctx.researchRows
+          ? gateCoreEvidence(
+              { ticker, skipped: false },
+              ctx.researchRows.get(ticker),
+            )
+          : null;
+    const blockNote = blockedReason
+      ? `신규 매수 제외(④ 보유 점검): ${blockedReason}`
+      : gateReason;
+    const skipped = preSkipped || blockNote !== null;
+    if (blockNote) dropped.push(`${blockNote} — ${CATEGORY_LABEL[category]} ${ticker}`);
 
     // ③은 더 이상 갈아타기를 만들지 않는다 — 옛 형식이 와도 매수로만 받는다
     if (action === "switch") {
@@ -444,7 +619,8 @@ export function normalizePicks(
       refPrice: skipped ? null : price,
       skipped,
       explicitSkip,
-      rationale: String(p.rationale ?? ""),
+      // 게이트·④ 경고로 건너뛴 경우 그 사유를 화면에서도 읽을 수 있게 rationale에 남긴다
+      rationale: [String(p.rationale ?? ""), blockNote].filter(Boolean).join("\n"),
       sourceDocIds: Array.isArray(p.source_doc_ids)
         ? p.source_doc_ids.map((n) => Number(n)).filter((n) => injected.has(n))
         : [...injected],

@@ -32,15 +32,19 @@ import {
   activeCategories,
   activeCategoriesLine,
   applyRealtimePrices,
+  blockedBuyTickers,
   budgetLine,
   extractJson,
   holdingLine,
   normalizePicks,
+  priorWatchlistBlock,
   realtimePriceBlock,
   recommendOutputRules,
   researchTickers,
   roleBudgetLine,
   ROLE_CATEGORY,
+  skipTally,
+  stopBuyingBlock,
 } from "@/domain/recommendation";
 import { getPrompt } from "@/domain/prompts";
 import { checkDocument, issuesToProblems } from "@/domain/dataChecks";
@@ -48,7 +52,7 @@ import { checkCodexAuth, runCodex, tailLog } from "./codex";
 import { getRealtimePrices } from "./livePrice";
 import { researchPath } from "./paths";
 import { notify } from "./notify";
-import { runHoldingWatch } from "./watch";
+import { latestScheduledDoc, openAlerts, runHoldingWatch } from "./watch";
 import { runConsolidateReview } from "./consolidate";
 import { currentWeeklyUsage, usageSince } from "./usage";
 
@@ -179,9 +183,22 @@ async function runResearch(opts: {
       opts.categories ?? getMonthlyTopup().then(activeCategories),
     ]);
 
+    // ①은 이전 문서를 받지 않아 관찰 목록이 회차마다 통째로 바뀔 수 있다.
+    // 최신 ① 문서의 데이터 표를 "직전 관찰 목록"으로 되돌려 넣어 연속성을 준다.
+    const priorBlock =
+      opts.slot === "weekly"
+        ? priorWatchlistBlock(
+            await latestScheduledDoc().then((d) =>
+              d ? parseResearchDoc(d.content) : null,
+            ),
+            categories,
+          )
+        : "";
+
     const prompt = [
       body,
       ...(opts.slot === "purchase" ? [activeCategoriesLine(categories)] : []),
+      ...(priorBlock ? [priorBlock] : []),
       buildFormatInstruction({
         type,
         dateKey,
@@ -467,12 +484,15 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
       (d) => d.id !== research.docId,
     );
 
-    const [balances, holdings, { body }, roleWeights] = await Promise.all([
-      getBalances(),
-      getHoldings(),
-      getPrompt("recommend"),
-      getGrowthRoleWeights(),
-    ]);
+    const [balances, holdings, { body }, roleWeights, alerts] =
+      await Promise.all([
+        getBalances(),
+        getHoldings(),
+        getPrompt("recommend"),
+        getGrowthRoleWeights(),
+        // ④가 남긴 미해결 경고 — stop_buying·sell 종목은 이번 회차 신규 매수에서 뺀다
+        openAlerts(),
+      ]);
 
     const budgetLines = CATEGORIES.flatMap((c) => [
       budgetLine(c, balances[c], active),
@@ -504,6 +524,8 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
       "",
       "[현재 보유 현황]",
       holdingLines,
+      "",
+      stopBuyingBlock(alerts),
       "",
       liveBlock,
       "",
@@ -567,6 +589,10 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
         .filter((r) => r.price !== null && r.price > 0)
         .map((r) => [r.ticker, r.price!] as const),
     );
+    // 핵심 자료 게이트는 가격만이 아니라 행 전체를 본다 (실부담비용·순자산·거래대금·1년 총수익률)
+    const researchRows = new Map(
+      freshParsed.dataRows.map((r) => [r.ticker, r] as const),
+    );
     // 재배분 전 잔액 — 정규화와 applyRealtimePrices가 같은 값을 써야 이월액이 어긋나지 않는다
     const normalizeBalances = activeBalances(balances, active);
     const { rows: normalized, dropped } = normalizePicks(picks, {
@@ -575,6 +601,8 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
       active,
       roleWeights,
       researchPrices,
+      researchRows,
+      blockedTickers: blockedBuyTickers(alerts),
     });
 
     // 조사 문서의 가격은 이미 묵은 값이다. 증권사 앱과 같은 값으로 사려면
@@ -604,6 +632,8 @@ async function recommendFlow(): Promise<RecommendFlowResult> {
     }
 
     const notes = [
+      // 게이트가 너무 세면 매달 전부 건너뛰게 된다 — 완화 검토의 근거가 되는 지표다
+      skipTally(priced.rows),
       priced.eligible
         ? `실시간가 적용 ${priced.applied}/${priced.eligible}건` +
           (priced.excluded.length ? ` (제외 사유: ${priced.excluded.join(", ")})` : "")

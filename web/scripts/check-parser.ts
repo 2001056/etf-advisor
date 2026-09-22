@@ -158,6 +158,67 @@ check("산출 기준 파싱", w.dataRows[0].yieldBasis, "trailing12m");
 check("음수 총수익률", w.dataRows[2].totalReturn1y, -4.5);
 check("분배율 높은데 NAV down", w.dataRows[2].navTrend, "down");
 check("새 열 있어도 형식 경고 없음", w.problems.length, 0);
+check("10컬럼 문서는 구 형식으로 표시", w.dataRows[0].hasEvidenceColumns, false);
+check("  핵심 증거 4열은 null", [
+  w.dataRows[0].aumBn, w.dataRows[0].costPct, w.dataRows[0].turnoverBn, w.dataRows[0].mdd1yPct,
+], [null, null, null, null]);
+
+console.log("\n--- 핵심 증거 4열: 14컬럼 파싱 ---");
+// ③ 게이트가 보는 열. 순자산(억원 정수)·실부담비용(%)·거래대금(억원)·1년 최대낙폭(음수 %)
+const WIDE14 = GOOD.replace(
+  "| ticker | name | category | price | dist_yield | premium | note |",
+  "| ticker | name | category | price | dist_yield | total_return_1y | nav_trend | yield_basis | premium | note | aum_bn | cost_pct | turnover_bn | mdd_1y_pct |",
+)
+  .replace("|--------|------|----------|-------|------------|---------|------|",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+  .replace("| 446720 | SOL 미국배당다우존스 | 배당성장 | 12,345 | 3.5% | 0.12 | 정상 |",
+           "| 446720 | SOL 미국배당다우존스 | 배당성장 | 12,345 | 3.5% | 14.2 | up | trailing12m | 0.12 | 정상 | 12000 | 0.19 | 35.0 | -12.4 |")
+  .replace("| 133690 | TIGER 미국나스닥100 | 자산성장 | 179030 | 0.3 | -0.05 |  |",
+           "| 133690 | TIGER 미국나스닥100 | 자산성장 | 179030 | 0.3 | 22.1 | up | trailing12m | -0.05 |  | 40 | NA | 120.5 | -18.2 |")
+  .replace("| 486290 | 미확인 ETF | 고배당 |  |  |  | 가격 확인 실패 |",
+           "| 486290 | 미확인 ETF | 고배당 | 9000 | 17.3 | -4.5 | down | target |  | NAV 하락 | NA | 0.35 | NA | NA |");
+const w14 = parseResearchDoc(WIDE14);
+check("형식 경고 없음", w14.problems, []);
+check("순자산(억원 정수)", w14.dataRows[0].aumBn, 12000);
+check("실부담비용(%)", w14.dataRows[0].costPct, 0.19);
+check("거래대금(억원, 소수 1자리)", w14.dataRows[0].turnoverBn, 35);
+check("최대 낙폭(음수 %)", w14.dataRows[0].mdd1yPct, -12.4);
+check("14컬럼이면 구 형식이 아니다", w14.dataRows[0].hasEvidenceColumns, true);
+check("NA 는 null (cost_pct)", w14.dataRows[1].costPct, null);
+check("NA 여도 형식 경고 아님", w14.problems.length, 0);
+check("NA 3개 행도 구 형식은 아니다", [
+  w14.dataRows[2].aumBn, w14.dataRows[2].turnoverBn, w14.dataRows[2].mdd1yPct,
+  w14.dataRows[2].hasEvidenceColumns,
+], [null, null, null, true]);
+check("빈 칸도 null", w14.dataRows[1].costPct, null);
+check("기존 10컬럼 값은 그대로", [
+  w14.dataRows[0].totalReturn1y, w14.dataRows[0].navTrend, w14.dataRows[0].premium,
+], [14.2, "up", 0.12]);
+check("return_basis 열이 없으면 빈 문자열", w14.dataRows[0].returnBasis, "");
+
+console.log("\n--- 수익률 기간 기준: 15컬럼 파싱 ---");
+// total_return_1y 숫자는 그대로 두고 그 값이 잰 기간만 return_basis 가 정한다.
+const WIDE15 = GOOD.replace(
+  "| ticker | name | category | price | dist_yield | premium | note |",
+  "| ticker | name | category | price | dist_yield | total_return_1y | return_basis | nav_trend | yield_basis | premium | note | aum_bn | cost_pct | turnover_bn | mdd_1y_pct |",
+)
+  .replace("|--------|------|----------|-------|------------|---------|------|",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+  .replace("| 446720 | SOL 미국배당다우존스 | 배당성장 | 12,345 | 3.5% | 0.12 | 정상 |",
+           "| 446720 | SOL 미국배당다우존스 | 배당성장 | 12,345 | 3.5% | 14.2 | 1y | up | trailing12m | 0.12 | 정상 | 12000 | 0.19 | 35.0 | -12.4 |")
+  .replace("| 133690 | TIGER 미국나스닥100 | 자산성장 | 179030 | 0.3 | -0.05 |  |",
+           "| 133690 | TIGER 미국나스닥100 | 자산성장 | 179030 | 0.3 | 5.1 | since_listing:3 | up | trailing12m | -0.05 | 2026-06-30 상장 | 40 | 0.1 | 120.5 | -18.2 |")
+  .replace("| 486290 | 미확인 ETF | 고배당 |  |  |  | 가격 확인 실패 |",
+           "| 486290 | 미확인 ETF | 고배당 | 9000 | 17.3 | NA | NA | down | target |  | 상장 이후 실적 확인 불가 | 3000 | 0.35 | 25.0 | NA |");
+const w15 = parseResearchDoc(WIDE15);
+check("형식 경고 없음", w15.problems, []);
+check("1y 그대로", w15.dataRows[0].returnBasis, "1y");
+check("상장 N개월", w15.dataRows[1].returnBasis, "since_listing:3");
+check("  총수익률 숫자는 그 기간의 값", w15.dataRows[1].totalReturn1y, 5.1);
+check("둘 다 NA 면 수치는 null, 기준은 'na'",
+  [w15.dataRows[2].totalReturn1y, w15.dataRows[2].returnBasis], [null, "na"]);
+check("대문자·공백은 소문자로 정규화",
+  parseResearchDoc(WIDE15.replace("| 1y |", "|  1Y  |")).dataRows[0].returnBasis, "1y");
 
 console.log("\n--- 같은 지수의 비대표 행도 그대로 받는다 (표 행 수 제한 없음) ---");
 // ①이 대표 1개만 후보로 두되 비대표 상품도 표에 남기므로, 같은 지수 행이 여럿 온다.
@@ -181,7 +242,14 @@ check("종목 유니온에 비대표 포함", tickersOf(rep).includes("222220"),
 console.log("\n--- 예전 문서(새 열 없음)는 여전히 정상 ---");
 const old = parseResearchDoc(GOOD);
 check("형식 경고 없음", old.problems.length, 0);
-check("새 열은 null/빈문자", [old.dataRows[0].totalReturn1y, old.dataRows[0].navTrend], [null, ""]);
+check("새 열은 null/빈문자", [
+  old.dataRows[0].totalReturn1y, old.dataRows[0].returnBasis, old.dataRows[0].navTrend,
+], [null, "", ""]);
+check("핵심 증거 4열도 null", [
+  old.dataRows[0].aumBn, old.dataRows[0].costPct,
+  old.dataRows[0].turnoverBn, old.dataRows[0].mdd1yPct,
+], [null, null, null, null]);
+check("구 형식으로 표시된다", old.dataRows[0].hasEvidenceColumns, false);
 
 console.log(`\n=== 결과: ${failed === 0 ? "전부 통과" : `${failed}건 실패`} ===`);
 process.exit(failed === 0 ? 0 : 1);

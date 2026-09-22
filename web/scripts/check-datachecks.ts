@@ -11,8 +11,11 @@ function check(l: string, ok: boolean, d = "") {
 }
 const row = (o: Partial<DataRow>): DataRow => ({
   ticker: "446720", name: "테스트", category: "고배당", price: 10000,
-  distYield: 3, totalReturn1y: 10, navTrend: "up", yieldBasis: "trailing12m",
-  premium: 0.1, note: "", ...o,
+  distYield: 3, totalReturn1y: 10, returnBasis: "1y", navTrend: "up", yieldBasis: "trailing12m",
+  premium: 0.1, note: "비용:실부담",
+  aumBn: 12_000, costPct: 0.19, turnoverBn: 35, mdd1yPct: -12.4,
+  hasEvidenceColumns: true,
+  ...o,
 });
 const has = (rs: ReturnType<typeof checkRow>, f: string) => rs.some((i) => i.field === f);
 
@@ -49,6 +52,54 @@ console.log("\n=== 분배율 산출 기준 ===");
 check("target 기준이면 비교 주의", has(checkRow(row({ yieldBasis: "target" })), "yield_basis"));
 check("annualized_1m도 주의", has(checkRow(row({ yieldBasis: "annualized_1m" })), "yield_basis"));
 check("trailing12m은 통과", !has(checkRow(row({ yieldBasis: "trailing12m" })), "yield_basis"));
+
+console.log("\n=== 순자산 하한 (내부 보수 기준 — KRX 지정요건 자체가 아니다) ===");
+check("50억 미만이면 주의", has(checkRow(row({ aumBn: 40 })), "aum_bn"));
+const aumMsg = checkRow(row({ aumBn: 40 })).find((i) => i.field === "aum_bn")?.message ?? "";
+check("  문구에 관리종목·상장폐지",
+  aumMsg.includes("관리종목") && aumMsg.includes("상장폐지"));
+check("  내부 보수 기준임을 밝힌다", aumMsg.includes("내부 보수 기준"));
+check("  KRX 지정요건은 신탁원본액까지 함께 본다고 적는다",
+  aumMsg.includes("신탁원본액") && aumMsg.includes("상장 1년 경과"));
+check("대조군: 50억이면 통과", !has(checkRow(row({ aumBn: 50 })), "aum_bn"));
+check("대조군: 1조 2천억은 통과", !has(checkRow(row({ aumBn: 12_000 })), "aum_bn"));
+check("대조군: NA(null)면 검사 안 함", !has(checkRow(row({ aumBn: null })), "aum_bn"));
+
+console.log("\n=== 비용 기준 표기 (외부 검토 8차: 누락 = 총보수만) ===");
+const costFlag = (note: string, costPct: number | null = 0.19) =>
+  checkRow(row({ note, costPct })).find((i) => i.field === "cost_pct");
+check("플래그가 없으면 주의", costFlag("미정 / H, 2026-09-21 확인")?.severity === "warn");
+check("  문구는 총보수만으로 취급한다고 알린다",
+  costFlag("")?.message.includes("비용 기준 표기 누락 — 총보수만으로 취급") === true);
+check("  적어야 할 플래그 셋을 문구에 넣는다",
+  costFlag("")?.message.includes('"비용:실부담"') === true &&
+  costFlag("")?.message.includes('"비용:합성총보수"') === true &&
+  costFlag("")?.message.includes('"비용:총보수만"') === true);
+check('대조군: "비용:실부담"이면 통과', costFlag("공격 / 비H / 비용:실부담") === undefined);
+check('대조군: "비용:합성총보수"면 통과', costFlag("안정 / H / 비용:합성총보수") === undefined);
+check('대조군: "비용:총보수만"이면 통과', costFlag("비용:총보수만, 2026-09-21 확인") === undefined);
+check("대조군: cost_pct 가 NA 면 검사하지 않는다", costFlag("", null) === undefined);
+
+// 외부 검토 9차: 표기 변형도 watch 와 같은 함수(costFlag.parseCostFlag)로 읽는다 — 한쪽만 알아보면 안 된다.
+check('대조군: "비용: 실부담"(콜론 뒤 공백)도 통과', costFlag("공격 / 비H / 비용: 실부담") === undefined);
+check('대조군: "비용 : 실부담"(콜론 앞뒤 공백)도 통과', costFlag("공격 / 비H / 비용 : 실부담") === undefined);
+check('대조군: "비용:실부담비용"(뒤에 설명)도 통과', costFlag("공격 / 비H / 비용:실부담비용") === undefined);
+check('대조군: "비용 : 합성총보수"도 통과', costFlag("안정 / H / 비용 : 합성총보수") === undefined);
+check('대조군: "비용 : 총보수만"도 통과', costFlag("안정 / H / 비용 : 총보수만") === undefined);
+check("셋 중 어느 것도 아닌 플래그면 주의", costFlag("공격 / 비H / 비용:미확인")?.severity === "warn");
+
+console.log("\n=== 괴리율 2단계 (절댓값 기준) ===");
+const prem = (v: number) => checkRow(row({ premium: v })).find((i) => i.field === "premium");
+check("5% 이하는 통과", prem(4.9) === undefined);
+check("대조군: -4.9% 도 통과", prem(-4.9) === undefined);
+check("5% 초과는 LP 관리범위 문구", prem(6)?.message.includes("LP 관리범위") === true);
+check("-6% 도 같은 문구(절댓값)", prem(-6)?.message.includes("LP 관리범위") === true);
+check("  문구가 절댓값 기준임을 밝힌다", prem(-6)?.message.includes("절댓값") === true);
+check("-12% 도 2단계로 올라간다(절댓값)", prem(-12)?.message.includes("투자유의종목") === true);
+check("10% 초과는 투자유의종목 문구", prem(12)?.message.includes("투자유의종목") === true);
+check("  10% 초과 문구에 LP 관리범위는 안 쓴다", prem(12)?.message.includes("LP 관리범위") === false);
+check("대조군: 10%는 아직 1단계", prem(10)?.message.includes("LP 관리범위") === true);
+check("둘 다 severity=warn", prem(6)?.severity === "warn" && prem(12)?.severity === "warn");
 
 console.log("\n=== 괴리율 항등식 ===");
 check("계산과 일치하면 통과", checkPremiumIdentity("A", 10100, 10000, 1.0) === null);

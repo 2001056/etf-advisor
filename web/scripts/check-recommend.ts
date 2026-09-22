@@ -8,24 +8,34 @@ import {
   activeCategoriesLine,
   allocateBudgets,
   applyRealtimePrices,
+  blockedBuyTickers,
   budgetLine,
   computeRefQty,
   extractJson,
+  gateCoreEvidence,
   holdingLine,
   isDrift,
   NormalizedPick,
   normalizePicks,
   normalizeRoleWeights,
   positiveInt,
+  priorWatchlistBlock,
   realtimePriceBlock,
   recommendOutputRules,
   researchTickers,
   roleBudgetLine,
   seatBudget,
+  skipTally,
+  stopBuyingBlock,
   toInt,
 } from "../src/domain/recommendation";
 import { Category, isMarketOpenKST } from "../src/domain/money";
-import { buildFormatInstruction, parseResearchDoc } from "../src/domain/docFormat";
+import {
+  buildFormatInstruction,
+  DataRow,
+  ParsedDoc,
+  parseResearchDoc,
+} from "../src/domain/docFormat";
 
 let failed = 0;
 function check(label: string, actual: unknown, expected: unknown) {
@@ -1190,6 +1200,32 @@ console.log("\n=== 형식 지시문: 세 개 활성이면 HEAD 원문 스냅샷�
 // 있어야 한다(전에는 ③ 출력 규칙에만 있었다). 그래서 자산성장이 보이는 문서에는 ## 3 안내
 // 뒤에 [자리 정의] 4줄이 붙는다 — 세 카테고리가 모두 활성이어도 자산성장이 있으니 붙는다.
 // 자산성장이 없는 문서(고배당만 등)에는 붙지 않는다(아래 대조군).
+//
+// 2026-09-21 (외부 검토 5차) 갱신 사유: 데이터 표에 ③ 핵심 증거 4열
+// (aum_bn·cost_pct·turnover_bn·mdd_1y_pct)을 붙여 10컬럼 → 14컬럼이 됐고,
+// 자산성장 예시 행을 가짜 코드로 바꾸면서 "예시 행은 실제 표에 넣지 않는다" 한 줄이 늘었다.
+//
+// 2026-09-21 (외부 검토 6차) 갱신 사유: cost_pct 를 NA 로 두던 규칙이 과잉 기권을 만들어
+// (게이트가 NA 하나로 후보를 통째로 버린다) 총보수만 찾았을 때도 그 값을 넣고 note 에
+// "비용:총보수만"을 적도록 바꿨다. cost_pct 규칙 2줄 → 4줄, [자리 정의] note 줄에 순서 한 문장.
+//
+// 2026-09-21 (외부 검토 7차) 갱신 사유: 비용 폴백을 두 갈래로 나눴다 —
+// 합성총보수(= 총보수 + 기타비용)는 "비용:합성총보수", 총보수만은 "비용:총보수만"이다.
+// cost_pct 규칙 4줄 → 7줄, note 구분자 규칙 3줄이 늘고 [자리 정의] note 줄이 바뀌었다.
+//
+// 2026-09-21 (외부 검토 8차) 갱신 사유: "실부담비용이면 플래그를 적지 않는다"를 버렸다 —
+// 플래그 누락과 실부담비용이 구분되지 않아 누락이 최고 등급으로 읽혔다. 이제 셋 중 하나를
+// 반드시 적게 하고("비용:실부담" 포함), 누락은 총보수만으로 취급한다.
+// cost_pct 규칙 7줄 → 9줄, note 규칙 한 줄이 바뀌었다.
+//
+// 2026-09-22 (외부 검토 9차) 갱신 사유: 게이트 안내가 cost_pct 밑에만 있어 total_return_1y 가
+// 후보를 거르는 열이라는 사실이 지시문에 없었다. total_return_1y 규칙에 NA 금지 한 줄(+상장
+// 1년 미만 대체)을 붙이고, turnover_bn 뒤에 핵심 증거 4열 게이트 2줄을 새로 넣었다.
+//
+// 2026-09-22 (외부 검토 10차) 갱신 사유: 수익률 기간 기준 컬럼 `return_basis` 를 추가해 14 → 15열.
+// total_return_1y 숫자는 그 컬럼에 그대로 두되 의미(최근 12개월 / 상장 N개월)는 return_basis 가 정한다.
+// total_return_1y 규칙에서 "NA 로 두지 마라"를 빼고 NA 예외(해당 기간의 실적 확인 불가 — 외부 검토 12차 문구)를 적었으며,
+// return_basis 규칙 6줄과 note 의 `3y_ann:N%` 표기 2줄이 늘고 핵심 증거 안내가 3줄이 됐다.
 const HEAD_FORMAT_ONDEMAND = `
 ────────────────────────────────
 [출력 형식 — 반드시 지킬 것]
@@ -1219,28 +1255,60 @@ model: (사용한 모델명)
 (각 항목에 ETF별 현재가·최근 분배금·분배율·괴리율·특이사항)
 
 [자리 정의] 공격적 성장: 변동이 크더라도 장기 기대 수익이 높은 성장 지수 / 안정적 성장: 여러 업종에 분산하여 특정 업종·종목 의존도를 낮추는 주식 지수
-- 자산성장으로 분류한 행은 ## 4 데이터 표의 note 첫머리에 자리(공격 / 안정 / 미정)와 환헤지 여부(H / 비H)를 적는다.
+- 자산성장으로 분류한 행은 ## 4 데이터 표의 note 첫머리에 자리(공격 / 안정 / 미정)와 환헤지 여부(H / 비H)를 적는다. note 앞부분은 "자리 / 환헤지 / 비용 플래그" 순으로 " / "로 구분해 적고, 그 뒤에 나머지를 적는다.
 - 상품 전략을 충분히 확인하지 못해 자리를 정할 수 없으면 "미정"으로 두고 그 사유를 note에 적는다. 억지로 한쪽에 넣지 마라.
 - 자산성장이 아닌 카테고리로 분류한 행에는 자리를 적지 않는다.
 
 ## 4. 데이터 표
-| ticker | name | category | price | dist_yield | total_return_1y | nav_trend | yield_basis | premium | note |
-|---|---|---|---|---|---|---|---|---|---|
-| 446720 | SOL 미국배당다우존스 | 배당성장 | 12345 | 3.5 | 14.2 | up | trailing12m | 0.1 | 비고 |
+| ticker | name | category | price | dist_yield | total_return_1y | return_basis | nav_trend | yield_basis | premium | note | aum_bn | cost_pct | turnover_bn | mdd_1y_pct |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 446720 | SOL 미국배당다우존스 | 배당성장 | 12345 | 3.5 | 14.2 | 1y | up | trailing12m | 0.1 | 비고 | 12000 | 0.19 | 35.0 | -12.4 |
 
 이 표 규칙(가장 중요):
-- 컬럼은 위 10개 그대로, 순서도 그대로.
+- 컬럼은 위 15개 그대로, 순서도 그대로.
+- 위 예시 행은 형식을 보여주는 가짜 값이다. 이 행은 예시이며 실제 표에는 넣지 않는다.
 - ticker는 앞의 0을 보존한 6자리 문자열.
 - price는 원 단위 정수만 (쉼표·"원" 금지). 나머지 비율은 % 기호 없는 숫자만.
 - category는 배당성장 / 자산성장 / 고배당 중 하나.
-- **total_return_1y**: 최근 12개월, NAV 기준, 분배금 재투자 가정 총수익률. 운용사·거래소 공시값을 우선 쓰고,
+- **total_return_1y**: NAV 기준, 분배금 재투자 가정 총수익률. 운용사·거래소 공시값을 우선 쓰고,
   공시값이 없으면 계산 근거를 note에 적어라. 시장가 기준이거나 분배금을 현금으로 합산한 방식이면 note에 명시한다.
   분배율과 나란히 비교하기 위한 값이다.
+  **어느 기간을 잰 값인지는 return_basis가 정한다** — 이 칸에는 그 기간의 총수익률 숫자만 넣어라.
+  상장 12개월 미만이라 1년 수익률이 없으면 **상장 이후 총수익률로 대체한다**.
+  NA는 **해당 기간의 실적**을 공시값·원자료 어느 것도 확인하지 못했을 때뿐이다 —
+  상장 12개월 이상이면 최근 12개월 실적, 12개월 미만이면 상장 이후 실적. 그때는 사유를 note에 적어라.
+- **return_basis**: total_return_1y가 어느 기간을 잰 값인지. 셋 중 하나다.
+  **1y** — 최근 12개월. 상장 12개월 이상이면 이 값만 쓴다.
+  **since_listing:N** — 상장 N개월(12 미만)의 상장 이후 총수익률. 예: 상장 3개월이면 \`since_listing:3\`.
+  **NA** — 해당 기간(12개월 이상은 최근 12개월, 미만은 상장 이후)의 실적을 확인하지 못한 경우. 이때는 total_return_1y도 함께 NA다(둘 다 NA).
+  total_return_1y가 값이 있는데 return_basis가 NA이거나 그 반대인 조합은 만들지 마라.
+  기간이 다른 수익률을 같은 숫자처럼 비교하는 것을 막으려는 열이다.
 - **nav_trend**: 최근 12개월 NAV 방향을 up / flat / down 중 하나로. 기간은 12개월로 고정이며,
   6개월만 관찰한 경우에는 그 사실을 note에 적어라. 확인 불가면 NA.
 - **yield_basis**: 그 분배율이 어떤 기준으로 산출된 값인지.
   trailing12m(후행 12개월 실지급) / annualized_1m(직전월 연율화) / target(목표분배율) / unknown 중 하나.
   기준이 다르면 종목 간 분배율 비교가 성립하지 않으므로 반드시 확인해서 적어라.
+- **aum_bn**: 순자산총액을 **억원 단위 정수**로. 예: 1조 2,000억원이면 12000. 확인 불가면 NA.
+- **cost_pct**: **실부담비용**(총보수 + 기타비용 + 매매·중개수수료율)을 % 기호 없는 숫자로. 예: 0.19.
+  실부담비용을 우선하되, 못 찾으면 차선을 넣어라.
+  **cost_pct에 값을 넣었으면 그 값이 무엇인지 note에 비용 플래그로 반드시 밝혀라 — 셋 중 하나다.**
+  **실부담비용**을 넣었으면 note에 "비용:실부담",
+  **합성총보수**(= 총보수 + 기타비용. 매매·중개수수료는 빠져 있다)를 넣었으면 note에 "비용:합성총보수",
+  **총보수만** 확인했으면 그 값을 넣고 note에 "비용:총보수만"을 적어라.
+  플래그를 빠뜨리면 시스템이 그 값을 **총보수만**으로 취급한다 — 누락을 실부담비용으로 봐주지 않는다.
+  NA로 두지 마라 — NA면 그 종목은 이번 회차 후보에서 통째로 빠진다.
+  셋 다 확인하지 못했을 때만 NA로 두고 그 사유를 note에 적어라.
+- **turnover_bn**: 최근 평균 거래대금을 **억원 단위**로(소수 첫째 자리까지 허용). 예: 35.0.
+  어느 기간의 평균인지 note에 적어라. 확인 불가면 NA.
+- **핵심 증거 4항목(total_return_1y+return_basis·aum_bn·cost_pct·turnover_bn)**은 후속 추천이 후보를 거르는 데 쓴다.
+  장기 총수익 항목은 total_return_1y와 return_basis가 **둘 다** 값이 있어야 확인된 것으로 인정한다.
+  넷 중 하나라도 NA면 그 종목은 이번 회차 후보에서 통째로 빠진다.
+- **mdd_1y_pct**: 최근 1년 최대 낙폭을 **음수** % 숫자로. 예: -18.2. 확인 불가면 NA.
+- **note**: 앞부분은 **"자리 / 환헤지 / 비용 플래그" 순으로 " / "로 구분해** 적고, 그 뒤에 나머지를 적어라.
+  자리는 자산성장 행에만 적고, 비용 플래그는 cost_pct가 NA가 아니면 언제나 적는다 — 없는 칸은 건너뛰고 순서만 지킨다.
+  예: "공격 / 비H / 비용:합성총보수, 2026-09-21 확인".
+  **3년 연환산 총수익률은 표에 컬럼이 없다** — 확인했으면 note에 \`3y_ann:14.2%\` 형태로만 적어라
+  (기간이 다르므로 total_return_1y 칸에 넣지 마라).
 - 확인하지 못한 값은 지어내지 말고 NA로 적고, note에 이유와 마지막 확인일을 남겨라.
 
 ## 5. 이벤트·뉴스
@@ -1269,7 +1337,12 @@ check(
 check(
   "자산성장만: 예시 행이 자산성장",
   fmtAsset.split("\n").filter((l) => /^\| \d{6} /.test(l)),
-  ["| 360750 | TIGER 미국S&P500 | 자산성장 | 12345 | 1.1 | 18.3 | up | trailing12m | 0.1 | 비고 |"],
+  ["| 999999 | 예시 ETF(가짜 코드) | 자산성장 | 12345 | 1.1 | 18.3 | 1y | up | trailing12m | 0.1 | 비고 | 12000 | 0.09 | 120.5 | -18.2 |"],
+);
+check(
+  "자산성장 예시 행은 실재하지 않는 종목이다",
+  fmtAsset.includes("이 행은 예시이며 실제 표에는 넣지 않는다"),
+  true,
 );
 check(
   "고배당만: 예시 행이 고배당",
@@ -1284,8 +1357,8 @@ check(
   fmtAsset
     .replace("### 자산성장", "### 배당성장\n### 자산성장\n### 고배당")
     .replace(
-      "| 360750 | TIGER 미국S&P500 | 자산성장 | 12345 | 1.1 | 18.3 | up | trailing12m | 0.1 | 비고 |",
-      "| 446720 | SOL 미국배당다우존스 | 배당성장 | 12345 | 3.5 | 14.2 | up | trailing12m | 0.1 | 비고 |",
+      "| 999999 | 예시 ETF(가짜 코드) | 자산성장 | 12345 | 1.1 | 18.3 | 1y | up | trailing12m | 0.1 | 비고 | 12000 | 0.09 | 120.5 | -18.2 |",
+      "| 446720 | SOL 미국배당다우존스 | 배당성장 | 12345 | 3.5 | 14.2 | 1y | up | trailing12m | 0.1 | 비고 | 12000 | 0.19 | 35.0 | -12.4 |",
     ) === HEAD_FORMAT_ONDEMAND,
   true,
 );
@@ -1699,6 +1772,202 @@ check("  배정액 = 각 카테고리 잔액", [buy.rows[0].budgetKrw, buy.rows[
 check("  수량도 그대로", [buy.rows[0].refQty, buy.rows[2].refQty], [24, 15]);
 check("자산성장만 자리 몫으로 줄어든다", [buy.rows[1].role, buy.rows[1].budgetKrw, buy.rows[1].refQty], ["aggressive", 105_000, 3]);
 check("  대조군: 전액이었다면 floor(210000/26335)", computeRefQty(210_000, 0, 26_335), 7);
+
+// ── ③ 핵심 자료 게이트 (외부 검토 5차) ─────────────────────
+// ② 표의 4열(실부담비용·순자산·거래대금·1년 총수익률) 중 하나라도 없으면 매수할 수 없다.
+// 티커·금액은 전부 합성 값이다.
+
+console.log("\n=== 핵심 자료 게이트: ② 표에 4항목이 다 있으면 통과한다(대조군) ===");
+const evRow = (o: Partial<DataRow>): DataRow => ({
+  ticker: "133690", name: "합성 성장 ETF", category: "자산성장", price: 21_000,
+  distYield: 0.5, totalReturn1y: 18.3, returnBasis: "1y", navTrend: "up", yieldBasis: "trailing12m",
+  premium: 0.1, note: "공격 / 비H",
+  aumBn: 12_000, costPct: 0.09, turnoverBn: 120.5, mdd1yPct: -18.2,
+  hasEvidenceColumns: true, ...o,
+});
+const gateBalances: Record<Category, number> = { div_growth: 0, asset_growth: 500_000, high_div: 0 };
+const gatePick = (o: Record<string, unknown> = {}) => ({
+  category: "자산성장", action: "buy", role: "aggressive", ticker: "133690",
+  etf_name: "합성 성장 ETF", budget_krw: 0, ref_price: 21_000, ref_qty: 1,
+  rationale: "근거", source_doc_ids: [], source_urls: [], ...o,
+});
+const gateCtx = (rows: DataRow[]) => ({
+  balances: gateBalances,
+  injectedDocIds: [] as number[],
+  active: ["asset_growth"] as Category[],
+  researchRows: new Map(rows.map((r) => [r.ticker, r] as const)),
+});
+const gateOk = normalizePicks({ picks: [gatePick()] }, gateCtx([evRow({})]));
+check("매수로 남는다", [gateOk.rows[0].skipped, gateOk.rows[0].ticker], [false, "133690"]);
+// dropped 에는 "안정 자리가 비었다"만 남는다 — 게이트 사유는 없어야 한다
+check("게이트 사유 없음", gateOk.dropped.filter((d) => d.includes("핵심 자료 미확인")), []);
+check("mdd_1y_pct 가 NA 여도 통과 — 게이트 대상이 아니다",
+  normalizePicks({ picks: [gatePick()] }, gateCtx([evRow({ mdd1yPct: null })])).rows[0].skipped, false);
+
+console.log("\n=== 4항목 중 하나라도 비면 건너뜀 ===");
+for (const [field, label] of [
+  ["costPct", "실부담비용"],
+  ["aumBn", "순자산총액"],
+  ["turnoverBn", "거래대금"],
+  ["totalReturn1y", "1년 총수익률"],
+] as const) {
+  const r = normalizePicks(
+    { picks: [gatePick()] },
+    gateCtx([evRow({ [field]: null } as Partial<DataRow>)]),
+  );
+  check(`${label} 없으면 건너뜀`, r.rows[0].skipped, true);
+  check(`  사유에 항목명`, r.rows[0].rationale.includes(`핵심 자료 미확인(②): ${label}`), true);
+  check(`  dropped 에도 기록`, r.dropped.some((d) => d.includes(label)), true);
+  check(`  종목·가격은 비운다`, [r.rows[0].ticker, r.rows[0].refPrice, r.rows[0].refQty], [null, null, 0]);
+}
+check("여러 개가 비면 사유에 전부 적는다",
+  normalizePicks({ picks: [gatePick()] }, gateCtx([evRow({ costPct: null, aumBn: null })]))
+    .rows[0].rationale.includes("실부담비용·순자산총액"), true);
+
+console.log("\n=== 장기 총수익은 수치와 기간 기준이 둘 다 있어야 확인된 것이다 ===");
+// 숫자만 있고 기간이 없으면 1년 수익률인지 상장 3개월 수익률인지 알 수 없다 — 비교가 성립하지 않는다.
+for (const basis of ["na", "NA", "", "-"]) {
+  const r = normalizePicks({ picks: [gatePick()] }, gateCtx([evRow({ returnBasis: basis })]));
+  check(`return_basis='${basis}' 이면 건너뜀`, r.rows[0].skipped, true);
+  check(`  사유에 항목명`, r.rows[0].rationale.includes("핵심 자료 미확인(②): 수익률 기간 기준"), true);
+}
+check("대조군: 1y 면 통과",
+  normalizePicks({ picks: [gatePick()] }, gateCtx([evRow({ returnBasis: "1y" })])).rows[0].skipped, false);
+check("대조군: since_listing:3 도 후보 자격은 있다",
+  normalizePicks({ picks: [gatePick()] }, gateCtx([evRow({ returnBasis: "since_listing:3" })])).rows[0].skipped, false);
+check("수치와 기준이 둘 다 비면 둘 다 적는다",
+  normalizePicks({ picks: [gatePick()] }, gateCtx([evRow({ totalReturn1y: null, returnBasis: "NA" })]))
+    .rows[0].rationale.includes("1년 총수익률·수익률 기간 기준"), true);
+
+console.log("\n=== 옛 10컬럼 문서는 null 이라 건너뜀이고 사유에 '구 형식 문서'가 붙는다 ===");
+const legacyDoc = parseResearchDoc(`---
+run_id: 1
+date: 2026-09-18
+type: ondemand
+tickers: [133690]
+model: x
+---
+
+## 1. 요약
+요약
+
+## 2. 시장 개관
+개관
+
+## 3. 카테고리별 ETF 현황
+### 자산성장
+내용
+
+## 4. 데이터 표
+| ticker | name | category | price | dist_yield | total_return_1y | nav_trend | yield_basis | premium | note |
+|---|---|---|---|---|---|---|---|---|---|
+| 133690 | 합성 성장 ETF | 자산성장 | 21000 | 0.5 | 18.3 | up | trailing12m | 0.1 | 공격 / 비H |
+
+## 5. 이벤트·뉴스
+없음
+
+## 6. 리스크 신호
+없음
+
+## 7. 출처
+- https://example.com
+`);
+check("파서 형식 경고 0 (옛 문서를 위반으로 잡지 않는다)", legacyDoc.problems, []);
+const legacy = normalizePicks({ picks: [gatePick()] }, gateCtx(legacyDoc.dataRows));
+check("건너뜀", legacy.rows[0].skipped, true);
+check("사유에 구 형식 문서 표기", legacy.rows[0].rationale.includes("구 형식 문서"), true);
+check("  1년 총수익률 수치는 있으나 기간 기준 열이 없어 함께 적힌다",
+  legacy.rows[0].rationale.includes("실부담비용·순자산총액·거래대금·수익률 기간 기준"), true);
+
+console.log("\n=== ② 표에 행 자체가 없으면 건너뜀 ===");
+const noRow = normalizePicks({ picks: [gatePick()] }, gateCtx([evRow({ ticker: "999998" })]));
+check("건너뜀", noRow.rows[0].skipped, true);
+check("사유에 행 없음", noRow.rows[0].rationale.includes("데이터 표에 133690 행이 없음"), true);
+
+console.log("\n=== 대조군: researchRows 를 안 주면 게이트가 돌지 않는다 ===");
+const noGate = normalizePicks(
+  { picks: [gatePick()] },
+  { balances: gateBalances, injectedDocIds: [], active: ["asset_growth"] as Category[] },
+);
+check("매수 그대로", [noGate.rows[0].skipped, noGate.rows[0].ticker], [false, "133690"]);
+check("사유 없음", noGate.dropped.filter((d) => d.includes("핵심 자료 미확인")), []);
+
+console.log("\n=== gateCoreEvidence 단독 ===");
+check("건너뛴 pick 은 게이트 대상이 아니다",
+  gateCoreEvidence({ ticker: null, skipped: true }, null), null);
+check("행이 다 차면 null", gateCoreEvidence({ ticker: "133690", skipped: false }, evRow({})), null);
+
+// ── ④ stop_buying·sell → ③ 신규 매수 제외 ────────────────────
+console.log("\n=== ④ 미해결 경고가 ③ 프롬프트에 블록으로 들어간다 ===");
+const ALERTS = [
+  { ticker: "133690", action: "stop_buying", issue: "추적오차 확대" },
+  { ticker: "446720", action: "sell", issue: "분배 재원이 원금 잠식" },
+  { ticker: "999997", action: "hold", issue: "이상 없음" },
+];
+const alertBlock = stopBuyingBlock(ALERTS);
+check("stop_buying 포함", alertBlock.includes("133690(신규 매수 중단 — 추적오차 확대)"), true);
+check("sell 도 포함", alertBlock.includes("446720(매도 권고 — 분배 재원이 원금 잠식)"), true);
+check("hold 는 빠진다", alertBlock.includes("999997"), false);
+check("머리줄 형식", alertBlock.startsWith("[보유 점검 경고 — 신규 매수 제외: "), true);
+check("대조군: 막을 것이 없으면 빈 문자열", stopBuyingBlock([ALERTS[2]]), "");
+check("대조군: 경고가 아예 없어도 빈 문자열", stopBuyingBlock([]), "");
+
+console.log("\n=== 막힌 티커의 buy pick 은 건너뜀이 된다 ===");
+const blockedCtx = {
+  ...gateCtx([evRow({})]),
+  blockedTickers: blockedBuyTickers(ALERTS),
+};
+const blocked = normalizePicks({ picks: [gatePick()] }, blockedCtx);
+check("건너뜀", blocked.rows[0].skipped, true);
+check("사유", blocked.rows[0].rationale.includes("신규 매수 제외(④ 보유 점검): 신규 매수 중단 — 추적오차 확대"), true);
+check("dropped 기록", blocked.dropped.some((d) => d.includes("신규 매수 제외(④ 보유 점검)")), true);
+check("종목·가격 비움", [blocked.rows[0].ticker, blocked.rows[0].refQty], [null, 0]);
+check("대조군: 목록에 없는 티커는 그대로 매수",
+  normalizePicks({ picks: [gatePick({ ticker: "999996" })] }, {
+    ...gateCtx([evRow({ ticker: "999996" })]),
+    blockedTickers: blockedBuyTickers(ALERTS),
+  }).rows[0].skipped, false);
+check("대조군: blockedTickers 를 안 주면 그대로 매수",
+  normalizePicks({ picks: [gatePick()] }, gateCtx([evRow({})])).rows[0].skipped, false);
+
+// ── ① 직전 관찰 목록 ────────────────────────────────────────
+console.log("\n=== ① 직전 관찰 목록 블록 ===");
+const prior = {
+  frontmatter: {}, sections: {}, problems: [],
+  dataRows: [
+    evRow({ ticker: "111110", name: "합성 대표 성장", note: "공격 / 비H, 대표 상품" }),
+    evRow({ ticker: "222220", name: "합성 분산 성장", note: "안정 / H, 동일 지수 비대표(대표: 111110) — 비용이 더 비싸고 순자산이 작아서 대표로 뽑지 않았다" }),
+    evRow({ ticker: "333330", name: "합성 고배당", category: "고배당", note: "커버드콜" }),
+  ],
+} as ParsedDoc;
+const priorBlock = priorWatchlistBlock(prior, ["asset_growth"]);
+check("머리줄", priorBlock.startsWith("[직전 관찰 목록 — 지난 정기 조사 문서의 데이터 표]"), true);
+check("활성 카테고리 행만", [priorBlock.includes("111110"), priorBlock.includes("333330")], [true, false]);
+check("티커·이름", priorBlock.includes("| 111110 합성 대표 성장 | 공격 / 비H, 대표 상품"), true);
+check("note 는 60자에서 자른다",
+  priorBlock.split("\n").find((l) => l.includes("222220"))?.includes("…"), true);
+check("  60자 + 말줄임", (priorBlock.split("\n").find((l) => l.includes("222220")) ?? "")
+  .split(" | ")[2].length, 61);
+check("'기존 대표 상품' 을 가리킨다", priorBlock.includes("기존 대표 상품"), true);
+check("대조군: 문서가 없으면 빈 문자열", priorWatchlistBlock(null, ALL), "");
+check("대조군: 활성 카테고리 행이 없으면 빈 문자열", priorWatchlistBlock(prior, ["div_growth"]), "");
+
+// ── 건너뜀률 지표 ───────────────────────────────────────────
+console.log("\n=== 건너뜀 N/M 자리 (사유별 집계) ===");
+check("사유별로 센다", skipTally([
+  { skipped: true, rationale: "핵심 자료 미확인(②): 실부담비용" },
+  { skipped: true, rationale: "근거\n핵심 자료 미확인(②): 거래대금" },
+  { skipped: false, rationale: "매수" },
+]), "건너뜀 2/3 자리 (핵심 자료 미확인(②) 2)");
+check("④ 경고와 실시간가를 나눠 센다", skipTally([
+  { skipped: true, rationale: "신규 매수 제외(④ 보유 점검): 매도 권고 — x" },
+  { skipped: true, rationale: "133690 실시간가 없음 — 이번 회차 제외" },
+]), "건너뜀 2/2 자리 (④ 보유 점검 경고 1, 실시간가 없음 1)");
+check("분류되지 않으면 모델 판단", skipTally([{ skipped: true, rationale: "" }]),
+  "건너뜀 1/1 자리 (모델 판단(skip) 1)");
+check("대조군: 하나도 안 건너뛰면 괄호 없음",
+  skipTally([{ skipped: false, rationale: "" }]), "건너뜀 0/1 자리");
+check("대조군: 행이 없으면 빈 문자열", skipTally([]), "");
 
 console.log(`\n=== 결과: ${failed === 0 ? "전부 통과" : `${failed}건 실패`} ===`);
 process.exit(failed === 0 ? 0 : 1);

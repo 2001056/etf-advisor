@@ -1,3 +1,4 @@
+import { parseCostFlag } from "./costFlag";
 import { DataRow, ParsedDoc } from "./docFormat";
 
 /**
@@ -28,8 +29,23 @@ const PRICE_MAX = 5_000_000;
 
 /** 분배율 상식 범위. 국내 커버드콜도 20%대가 상한선이다 */
 const YIELD_MAX = 40;
-/** 괴리율은 정상 시장에서 ±5%를 넘기 어렵다 */
+/**
+ * 괴리율 2단계 — **절댓값** 기준이다(음수 괴리율도 같은 선에서 잡는다).
+ * - |괴리율| 5% 초과: 해외 ETF의 LP 호가 관리범위를 넘는다 → 주의
+ * - |괴리율| 10% 초과: 투자유의종목 지정예고 요건 → 같은 주의지만 문구를 강화한다
+ * 출처: 금융위원회 2026년 8월 안내 https://www.fsc.go.kr/po010106/87512
+ */
 const PREMIUM_ABS_MAX = 5;
+const PREMIUM_ABS_SEVERE = 10;
+
+/**
+ * 순자산총액 하한(억원) — **이 도우미의 내부 보수 기준**이다.
+ * KRX 관리종목 지정요건은 상장 1년 경과 ETF가 반기말 기준 신탁원본액과 순자산총액을
+ * 모두 50억 미만으로 둘 때이고(출처: 한국거래소 안내
+ * https://www.krx.co.kr/contents/LST/06/06010500/LST06010500.jsp),
+ * 여기서는 순자산 하나만 보므로 지정요건 자체가 아니라 그보다 보수적인 선이다.
+ */
+const AUM_BN_MIN = 50;
 
 function num(v: number | null): v is number {
   return v !== null && Number.isFinite(v);
@@ -58,7 +74,35 @@ export function checkRow(r: DataRow): DataIssue[] {
   }
 
   if (num(r.premium) && Math.abs(r.premium) > PREMIUM_ABS_MAX) {
-    add("premium", "warn", `괴리율 ${r.premium}%가 비정상적으로 큽니다`);
+    add(
+      "premium",
+      "warn",
+      Math.abs(r.premium) > PREMIUM_ABS_SEVERE
+        ? `괴리율 ${r.premium}%는 절댓값이 ${PREMIUM_ABS_SEVERE}%를 넘어 투자유의종목 지정예고 요건에 해당합니다 — 이 가격으로 사면 NAV와 크게 벌어진 값에 거래합니다`
+        : `괴리율 ${r.premium}%는 절댓값이 ${PREMIUM_ABS_MAX}%를 넘어 해외 ETF LP 관리범위를 벗어납니다`,
+    );
+  }
+
+  // 순자산이 작으면 상품 자체가 없어질 수 있다 — 장기 적립에 치명적이다
+  if (num(r.aumBn) && r.aumBn < AUM_BN_MIN) {
+    add(
+      "aum_bn",
+      "warn",
+      `순자산총액 ${r.aumBn}억원은 ${AUM_BN_MIN}억 미만입니다 — 순자산 하나만 보는 내부 보수 기준입니다. ` +
+        `KRX 관리종목 지정요건은 상장 1년 경과 ETF가 반기말 기준 신탁원본액과 순자산총액 모두 ${AUM_BN_MIN}억 미만일 때이며, ` +
+        "다음 반기말까지 해소하지 못하면 상장폐지 대상이 됩니다",
+    );
+  }
+
+  // 비용 플래그가 없으면 cost_pct가 무엇을 잰 값인지 알 수 없다 — 가장 보수적으로 총보수만으로 읽는다.
+  // 실부담비용을 넣고 플래그만 빠뜨린 행도 ③에서 비용 점수가 최하로 깎이므로 사람이 채워야 한다.
+  // 플래그가 셋 중 하나로 읽히는지까지 본다 — 읽는 쪽(watch.ts)과 같은 함수를 쓴다
+  if (num(r.costPct) && parseCostFlag(r.note) === null) {
+    add(
+      "cost_pct",
+      "warn",
+      '비용 기준 표기 누락 — 총보수만으로 취급 (note에 "비용:실부담" / "비용:합성총보수" / "비용:총보수만" 중 하나를 적어야 합니다)',
+    );
   }
 
   // 리서치 핵심: 분배율이 높은데 총수익률이 그에 못 미치고 NAV가 하락 중이면
