@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import { closeCycleAction } from "../actions";
 import { getBalances, getCycle, isOnboarded } from "@/domain/ledger";
-import { listPurchases } from "@/domain/purchases";
+import { holdingRoles, listPurchases } from "@/domain/purchases";
 import { tickerCandidates } from "@/domain/tickers";
 import {
   CATEGORIES,
@@ -25,11 +25,12 @@ export const dynamic = "force-dynamic";
 export default async function PurchasesPage() {
   if (!(await isOnboarded())) redirect("/onboarding");
 
-  const [rows, balances, cycle, candidates] = await Promise.all([
+  const [rows, balances, cycle, candidates, roles] = await Promise.all([
     listPurchases(),
     getBalances(),
     getCycle(),
     tickerCandidates(),
+    holdingRoles(),
   ]);
 
   return (
@@ -49,6 +50,7 @@ export default async function PurchasesPage() {
             value: r,
             label: GROWTH_ROLE_LABEL[r],
           }))}
+          seats={Object.fromEntries(roles)}
         />
       </Card>
 

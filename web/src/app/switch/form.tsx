@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useMemo, useState } from "react";
+import { FormEvent, startTransition, useActionState, useState } from "react";
 import { useRouter } from "next/navigation";
 import { switchAction } from "../actions";
 import { buttonClass, inputClass, Notice } from "@/components/ui";
@@ -24,10 +24,16 @@ const CATEGORY_LABEL: Record<string, string> = {
 
 type Option = { value: string; label: string };
 
+const keyOf = (h: Holding) => `${h.category}::${h.ticker}`;
+
 /**
  * 갈아타기 폼. 매도 종목은 보유분 중에서만 고른다(그 선택이 매도 카테고리를 정한다).
  * 매수는 후보 검색으로 고르고, 매수 카테고리를 따로 고를 수 있다 — 다르면 매도대금 전액이
  * 매수 카테고리로 옮겨진다. 서버가 한 번에 실행한다.
+ *
+ * 화면에 보이는 값이 곧 제출되는 값이어야 한다: 값에 따라 안내가 바뀌는 select 는 전부
+ * 상태로 제어하고, 안내·최대 수량·경고는 그 상태에서만 계산한다. 폼 action 으로 넘기면
+ * React 가 실행 뒤(실패해도) 폼을 비워 select 가 첫 항목으로 돌아가므로 직접 제출한다.
  */
 export default function SwitchForm({
   today,
@@ -37,6 +43,7 @@ export default function SwitchForm({
   active,
   roleCategory,
   roleOptions,
+  seats,
 }: {
   today: string;
   holdings: Holding[];
@@ -47,31 +54,63 @@ export default function SwitchForm({
   /** 자리(공격·안정)를 두는 카테고리 */
   roleCategory: string;
   roleOptions: Option[];
+  /** 지금 자리가 정해진 보유 종목 — 키는 `카테고리::종목코드` */
+  seats: Record<string, string>;
 }) {
   const router = useRouter();
-  const [sellKey, setSellKey] = useState(
-    holdings[0] ? `${holdings[0].category}::${holdings[0].ticker}` : "",
-  );
-  const selected = useMemo(
-    () => holdings.find((h) => `${h.category}::${h.ticker}` === sellKey),
-    [holdings, sellKey],
-  );
-  // 매수 카테고리 기본값: 매도 종목의 카테고리가 적립 중(활성)이면 그대로, 아니면 첫 활성 카테고리.
-  // 사람이 직접 고르기 전까지는 매도 종목을 바꿀 때마다 기본값을 따라간다.
-  const [buyCatPicked, setBuyCatPicked] = useState<string | null>(null);
+  const [sellKey, setSellKey] = useState("");
+  // 직접 고른 매수 카테고리는 고를 때의 매도 종목에만 붙는다 — 매도 종목이 바뀌면 기본값으로
+  const [buyCatPick, setBuyCatPick] = useState<{
+    sellKey: string;
+    value: string;
+  } | null>(null);
+  const [buyTicker, setBuyTicker] = useState("");
+  const [seat, setSeat] = useState("");
+  // 성공했을 때만 올려 폼을 새로 그린다(입력칸·종목 검색 비우기)
+  const [formKey, setFormKey] = useState(0);
+
+  // 고른 보유가 새로고침으로 사라졌으면(전량 매도 등) 첫 보유로 — select 표시와 안내가 늘 같은 종목
+  const selected = holdings.find((h) => keyOf(h) === sellKey) ?? holdings[0];
+  const effectiveSellKey = selected ? keyOf(selected) : "";
+  // 매수 카테고리 기본값: 매도 종목의 카테고리가 적립 중(활성)이면 그대로, 아니면 첫 활성 카테고리
   const defaultBuyCat =
     selected && !active.includes(selected.category)
       ? (active[0] ?? selected.category)
       : (selected?.category ?? "");
-  const buyCat = buyCatPicked ?? defaultBuyCat;
-  const [state, action, pending] = useActionState<State, FormData>(
+  const buyCat =
+    buyCatPick && buyCatPick.sellKey === effectiveSellKey
+      ? buyCatPick.value
+      : defaultBuyCat;
+  const cross = !!selected && buyCat !== selected.category;
+  const existingSeat =
+    buyCat === roleCategory && buyTicker.trim()
+      ? seats[`${buyCat}::${buyTicker.trim()}`]
+      : undefined;
+  const seatLabel = (v: string) =>
+    roleOptions.find((o) => o.value === v)?.label ?? v;
+
+  const [state, dispatch, pending] = useActionState<State, FormData>(
     async (_p, fd) => {
       const res = (await switchAction(fd)) ?? null;
-      if (res?.ok) router.refresh();
+      if (res?.ok) {
+        // 성공했을 때만 처음 상태로 — 실패하면 입력을 그대로 두어 고쳐서 다시 낼 수 있게
+        setSellKey("");
+        setBuyCatPick(null);
+        setBuyTicker("");
+        setSeat("");
+        setFormKey((k) => k + 1);
+        router.refresh();
+      }
       return res;
     },
     null,
   );
+
+  const onSubmit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const fd = new FormData(e.currentTarget);
+    startTransition(() => dispatch(fd));
+  };
 
   if (holdings.length === 0) {
     return (
@@ -82,7 +121,7 @@ export default function SwitchForm({
   }
 
   return (
-    <form action={action} className="space-y-6">
+    <form key={formKey} onSubmit={onSubmit} className="space-y-6">
       {/* 매도 */}
       <div className="space-y-4 rounded-lg border border-neutral-200 p-4">
         <h3 className="text-sm font-semibold text-neutral-800">팔 종목 (매도)</h3>
@@ -94,12 +133,15 @@ export default function SwitchForm({
             <select
               name="sell"
               required
-              value={sellKey}
-              onChange={(e) => setSellKey(e.target.value)}
+              value={effectiveSellKey}
+              onChange={(e) => {
+                setSellKey(e.target.value);
+                setBuyCatPick(null);
+              }}
               className={inputClass}
             >
               {holdings.map((h) => {
-                const key = `${h.category}::${h.ticker}`;
+                const key = keyOf(h);
                 return (
                   <option key={key} value={key}>
                     {CATEGORY_LABEL[h.category]} · {h.etfName} ({h.ticker}) · 보유{" "}
@@ -160,7 +202,9 @@ export default function SwitchForm({
               name="buyCategory"
               required
               value={buyCat}
-              onChange={(e) => setBuyCatPicked(e.target.value)}
+              onChange={(e) =>
+                setBuyCatPick({ sellKey: effectiveSellKey, value: e.target.value })
+              }
               className={inputClass}
             >
               {categories.map((c) => (
@@ -169,36 +213,63 @@ export default function SwitchForm({
                 </option>
               ))}
             </select>
-            {selected && buyCat !== selected.category && (
-              <span className="mt-1 block text-xs text-amber-700">
-                매도대금 전액이 {CATEGORY_LABEL[buyCat]} 잔액으로 옮겨집니다
-              </span>
+            {cross && selected && (
+              <>
+                <span className="mt-1 block text-xs text-amber-700">
+                  매도대금 전액이 {CATEGORY_LABEL[buyCat]} 잔액으로 옮겨집니다
+                </span>
+                {/* 경고가 보일 때만 실린다 — 서버는 이 값이 없거나 다르면 이전을 거부한다 */}
+                <input
+                  type="hidden"
+                  name="crossConfirm"
+                  value={`${selected.category}>${buyCat}`}
+                />
+              </>
             )}
           </label>
-          {buyCat === roleCategory && (
-            <label className="block">
-              <span className="mb-1 block text-sm font-medium text-neutral-700">
-                자리 <span className="text-neutral-400">(선택)</span>
-              </span>
-              <select name="role" defaultValue="" className={inputClass}>
-                <option value="">지정 안 함</option>
-                {roleOptions.map((r) => (
-                  <option key={r.value} value={r.value}>
-                    {r.label}
-                  </option>
-                ))}
-              </select>
-              <span className="mt-1 block text-xs text-neutral-500">
-                고르면 새로 사는 종목의 자리로 저장됩니다. 설정 화면에서도 바꿀 수
-                있습니다.
-              </span>
-            </label>
-          )}
+          {buyCat === roleCategory &&
+            (existingSeat ? (
+              <div className="block">
+                <span className="mb-1 block text-sm font-medium text-neutral-700">
+                  자리
+                </span>
+                <p className="rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm text-neutral-700">
+                  {seatLabel(existingSeat)}
+                </p>
+                <span className="mt-1 block text-xs text-neutral-500">
+                  이미 자리가 정해진 종목입니다. 바꾸려면 설정 화면에서 바꾸세요.
+                </span>
+              </div>
+            ) : (
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium text-neutral-700">
+                  자리 <span className="text-neutral-400">(선택)</span>
+                </span>
+                <select
+                  name="role"
+                  value={seat}
+                  onChange={(e) => setSeat(e.target.value)}
+                  className={inputClass}
+                >
+                  <option value="">지정 안 함</option>
+                  {roleOptions.map((r) => (
+                    <option key={r.value} value={r.value}>
+                      {r.label}
+                    </option>
+                  ))}
+                </select>
+                <span className="mt-1 block text-xs text-neutral-500">
+                  고르면 새로 사는 종목의 자리로 저장됩니다. 설정 화면에서도 바꿀 수
+                  있습니다.
+                </span>
+              </label>
+            ))}
           <div className="sm:col-span-2">
             <TickerPicker
               candidates={candidates}
               tickerName="buyTicker"
               etfNameName="buyEtfName"
+              onTickerChange={setBuyTicker}
             />
           </div>
           <label className="block">

@@ -28,15 +28,18 @@ export default function TickerPicker({
   etfNameName = "etfName",
   categoryName,
   onCategoryPicked,
+  onTickerChange,
   label = "종목",
 }: {
   candidates: Candidate[];
   tickerName?: string;
   etfNameName?: string;
-  /** 지정하면 고를 때 이 이름의 select/hidden 값도 함께 맞춘다 */
+  /** 지정하면 고를 때 이 이름의 select/hidden 값도 함께 맞춘다 (제어하지 않는 select 용) */
   categoryName?: string;
-  /** 위에서 구분을 맞췄을 때 알려준다 — DOM 값만 바꾸면 change 이벤트가 나지 않는다 */
+  /** 후보를 고를 때 그 후보의 구분을 알려준다 — 구분 select 를 상태로 제어하는 폼용 */
   onCategoryPicked?: (category: string) => void;
+  /** 종목코드 칸 값이 바뀔 때마다(입력·후보 선택) 알려준다 */
+  onTickerChange?: (ticker: string) => void;
   label?: string;
 }) {
   const [query, setQuery] = useState("");
@@ -74,12 +77,15 @@ export default function TickerPicker({
     setQuery(c.ticker);
     setEtfName(c.name);
     setOpen(false);
+    onTickerChange?.(c.ticker);
 
     // 구분 select도 같이 맞춰준다
-    if (categoryName && c.category) {
-      const form = boxRef.current?.closest("form");
-      const sel = form?.elements.namedItem(categoryName);
-      if (sel instanceof HTMLSelectElement) sel.value = c.category;
+    if (c.category) {
+      if (categoryName) {
+        const form = boxRef.current?.closest("form");
+        const sel = form?.elements.namedItem(categoryName);
+        if (sel instanceof HTMLSelectElement) sel.value = c.category;
+      }
       onCategoryPicked?.(c.category);
     }
   };
@@ -99,6 +105,7 @@ export default function TickerPicker({
         onChange={(e) => {
           setQuery(e.target.value);
           setOpen(true);
+          onTickerChange?.(e.target.value);
         }}
         onFocus={() => setOpen(true)}
         onKeyDown={(e) => {

@@ -21,7 +21,6 @@ import {
   runLazyTopup,
   setMonthlyTopup,
   setGrowthRoleWeights,
-  setHoldingRole,
   setHoldingRoles,
   type HoldingRoleChange,
   getRecommendation,
@@ -57,12 +56,16 @@ import {
   duplicateRecommendationMessage,
   executeSwitch,
   getHoldings,
-  holdingRoles,
   updatePurchase,
 } from "@/domain/purchases";
 import {
+  category,
+  parsePurchaseForm,
+  parseSwitchForm,
+  positiveNum,
+} from "@/domain/formInput";
+import {
   CATEGORIES,
-  CATEGORY_LABEL,
   Category,
   dateKeyKST,
   monthKeyKST,
@@ -73,66 +76,12 @@ function num(v: FormDataEntryValue | null): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-/** 폼에서 온 금액·수량. 빈칸이나 0 이하를 조용히 0으로 넘기지 않는다. */
-function positiveNum(v: FormDataEntryValue | null, label: string): number {
-  const raw = String(v ?? "").trim();
-  if (!raw) throw new Error(`${label}을(를) 입력하세요`);
-  const n = Number(raw.replace(/[,\s원]/g, ""));
-  if (!Number.isFinite(n) || n <= 0) throw new Error(`${label}은(는) 0보다 커야 합니다`);
-  return n;
-}
-
 /** 비워둬도 되는 숫자 칸 */
 function optionalNum(v: FormDataEntryValue | null): number | null {
   const raw = String(v ?? "").trim();
   if (!raw) return null;
   const n = Number(raw.replace(/[,\s원]/g, ""));
   return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
-}
-
-function category(v: FormDataEntryValue | null): Category {
-  const s = String(v ?? "");
-  if ((CATEGORIES as readonly string[]).includes(s)) return s as Category;
-  throw new Error(`알 수 없는 카테고리: ${s}`);
-}
-
-/** 매입·갈아타기 폼의 "자리" 칸. 빈칸 = 지정 안 함. 자리를 두는 카테고리의 매수에만 받는다 */
-function optionalSeat(
-  v: FormDataEntryValue | null,
-  cat: Category,
-): GrowthRole | null {
-  const raw = String(v ?? "").trim();
-  if (!raw) return null;
-  const role = toGrowthRole(raw);
-  if (!role) throw new Error(`알 수 없는 자리: ${raw}`);
-  if (cat !== ROLE_CATEGORY) {
-    throw new Error(
-      `자리는 ${CATEGORY_LABEL[ROLE_CATEGORY]} 매수에만 지정할 수 있습니다`,
-    );
-  }
-  return role;
-}
-
-/**
- * 매입이 기록된 뒤에만 자리를 남긴다. 여기서 실패해도 매입은 이미 들어갔으므로
- * 성공으로 돌려 폼이 같은 매입을 다시 제출하지 않게 하고, 자리만 다시 지정하라고 알린다.
- */
-async function saveSeatAfterPurchase(
-  cat: Category,
-  ticker: string,
-  role: GrowthRole | null,
-): Promise<{ ok: true; error?: string }> {
-  if (!role) return { ok: true };
-  try {
-    await setHoldingRole(cat, ticker, role);
-    revalidatePath("/settings");
-    return { ok: true };
-  } catch (e) {
-    return {
-      ok: true,
-      error: `매입은 기록했지만 자리를 저장하지 못했습니다 — 설정 화면에서 다시 지정하세요 (${e instanceof Error ? e.message : String(e)})`,
-    };
-  }
 }
 
 export async function setupAction(formData: FormData) {
@@ -189,34 +138,20 @@ export async function addPurchaseAction(
   formData: FormData,
 ): Promise<{ ok?: true; error?: string }> {
   await requireSession();
-  let cat: Category;
-  let ticker: string;
-  let seat: GrowthRole | null;
   try {
-    cat = category(formData.get("category"));
-    ticker = String(formData.get("ticker") ?? "").trim();
-    // 자리 값이 잘못됐으면 매입도 하지 않는다 — 검증은 기록보다 먼저
-    seat = optionalSeat(formData.get("role"), cat);
-    await addManualPurchase(
-      {
-        boughtAt: String(formData.get("boughtAt") || dateKeyKST()),
-        category: cat,
-        ticker,
-        etfName: String(formData.get("etfName") ?? "").trim(),
-        qty: positiveNum(formData.get("qty"), "수량"),
-        unitPrice: positiveNum(formData.get("unitPrice"), "매입 단가"),
-        memo: String(formData.get("memo") ?? "") || null,
-        skipLedger: formData.get("skipLedger") === "on",
-      },
-      { allowOverBalance: formData.get("allowOverBalance") === "on" },
-    );
+    // 폼 값 검증(자리 포함)이 먼저, 자리는 매입과 같은 트랜잭션에 저장된다
+    const p = parsePurchaseForm(formData, dateKeyKST());
+    await addManualPurchase(p.input, {
+      allowOverBalance: p.allowOverBalance,
+      role: p.role,
+    });
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) };
   }
-  const res = await saveSeatAfterPurchase(cat, ticker, seat);
   revalidatePath("/purchases");
+  revalidatePath("/settings");
   revalidatePath("/");
-  return res;
+  return { ok: true };
 }
 
 export async function updatePurchaseAction(
@@ -281,51 +216,18 @@ export async function switchAction(
   formData: FormData,
 ): Promise<{ ok?: true; error?: string }> {
   await requireSession();
-
-  // 매도 종목 선택값은 "category::ticker" — 매도 카테고리를 정한다
-  const sellKey = String(formData.get("sell") ?? "");
-  const sep = sellKey.indexOf("::");
-  if (sep < 0) return { error: "매도할 보유 종목을 고르세요" };
-  const cat = category(sellKey.slice(0, sep));
-  const sellTicker = sellKey.slice(sep + 2);
-
-  // 매수 카테고리 칸이 없으면(옛 화면) 매도 카테고리 그대로 — 예전 동작
-  const rawBuyCat = String(formData.get("buyCategory") ?? "").trim();
-  if (rawBuyCat && !(CATEGORIES as readonly string[]).includes(rawBuyCat)) {
-    return { error: `알 수 없는 매수 카테고리: ${rawBuyCat}` };
-  }
-  const buyCat = rawBuyCat ? (rawBuyCat as Category) : cat;
-  const buyTicker = String(formData.get("buyTicker") ?? "").trim();
-
-  let seat: GrowthRole | null;
   try {
-    seat = optionalSeat(formData.get("role"), buyCat);
-    await executeSwitch({
-      category: cat,
-      buyCategory: buyCat,
-      executedAt: String(formData.get("executedAt") || dateKeyKST()),
-      sell: {
-        ticker: sellTicker,
-        qty: positiveNum(formData.get("sellQty"), "매도 수량"),
-        unitPrice: positiveNum(formData.get("sellUnitPrice"), "매도 단가"),
-      },
-      buy: {
-        ticker: buyTicker,
-        etfName: String(formData.get("buyEtfName") ?? "").trim(),
-        qty: positiveNum(formData.get("buyQty"), "매수 수량"),
-        unitPrice: positiveNum(formData.get("buyUnitPrice"), "매수 단가"),
-      },
-      memo: String(formData.get("memo") ?? "") || null,
-    });
+    // 폼 값 검증(매도 종목·매수 카테고리·이전 확인·자리)이 먼저 — 틀리면 아무것도 쓰지 않는다
+    await executeSwitch(parseSwitchForm(formData, dateKeyKST()));
   } catch (e) {
     return { error: e instanceof Error ? e.message : "갈아타기에 실패했습니다" };
   }
 
-  const res = await saveSeatAfterPurchase(buyCat, buyTicker, seat);
   revalidatePath("/switch");
   revalidatePath("/purchases");
+  revalidatePath("/settings");
   revalidatePath("/");
-  return res;
+  return { ok: true };
 }
 
 /** [이번 달 매입 마감] — 다음날 lazy 충전이 다음 달 몫을 채운다 (§2.2) */
@@ -502,26 +404,29 @@ export async function saveGrowthRolesAction(formData: FormData) {
 
 /**
  * 보유 종목 자리 수동 지정 (설정 화면). 칸 이름은 `seat:카테고리::종목코드`, 값은 자리 또는 빈칸(미정).
+ * 같은 줄의 `orig:카테고리::종목코드` 는 화면을 그릴 때의 값이다.
  *
- * 화면에 보인 값(지금 자리)에서 바꾼 줄만 저장한다 — 손대지 않은 줄까지 수동 지정으로 굳히지 않는다.
+ * 화면을 그릴 때 값에서 사람이 바꾼 줄만 저장한다 — 저장 시점의 값과 비교하면, 화면을 연 뒤
+ * 다른 경로(매입 폼 등)로 바뀐 줄을 손대지 않았는데도 옛 화면 값으로 덮어쓴다.
  * 미정은 수동 지정을 지우는 것이라, 추천으로 산 기록이 있으면 그 자리로 돌아간다.
  */
 export async function saveHoldingRolesAction(
   formData: FormData,
 ): Promise<{ ok?: true; error?: string }> {
   await requireSession();
-  const [holdings, current] = await Promise.all([getHoldings(), holdingRoles()]);
+  const holdings = await getHoldings();
 
   const changes: HoldingRoleChange[] = [];
   for (const h of holdings) {
     if (h.category !== ROLE_CATEGORY) continue;
     const key = `${h.category}::${h.ticker}`;
     const v = formData.get(`seat:${key}`);
-    if (v === null) continue; // 화면을 연 뒤에 새로 생긴 보유 — 이번 저장과 무관
+    const orig = formData.get(`orig:${key}`);
+    if (v === null || orig === null) continue; // 화면을 연 뒤에 새로 생긴 보유 — 이번 저장과 무관
     const raw = String(v).trim();
+    if (raw === String(orig).trim()) continue; // 손대지 않은 줄
     const role = raw ? toGrowthRole(raw) : null;
     if (raw && !role) return { error: `알 수 없는 자리: ${raw}` };
-    if ((current.get(key) ?? null) === role) continue;
     changes.push({ category: h.category, ticker: h.ticker, role });
   }
 

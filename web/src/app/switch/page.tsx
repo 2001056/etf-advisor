@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { getBalances, getMonthlyTopup, isOnboarded } from "@/domain/ledger";
-import { getHoldings, listSales } from "@/domain/purchases";
+import { getHoldings, holdingRoles, listSales } from "@/domain/purchases";
 import { tickerCandidates } from "@/domain/tickers";
 import {
   CATEGORIES,
@@ -24,13 +24,15 @@ export const dynamic = "force-dynamic";
 export default async function SwitchPage() {
   if (!(await isOnboarded())) redirect("/onboarding");
 
-  const [holdings, candidates, sales, balances, topup] = await Promise.all([
-    getHoldings(),
-    tickerCandidates(),
-    listSales(50),
-    getBalances(),
-    getMonthlyTopup(),
-  ]);
+  const [holdings, candidates, sales, balances, topup, roles] =
+    await Promise.all([
+      getHoldings(),
+      tickerCandidates(),
+      listSales(50),
+      getBalances(),
+      getMonthlyTopup(),
+      holdingRoles(),
+    ]);
 
   return (
     <Page current="/switch">
@@ -51,6 +53,7 @@ export default async function SwitchPage() {
             value: r,
             label: GROWTH_ROLE_LABEL[r],
           }))}
+          seats={Object.fromEntries(roles)}
         />
       </Card>
 

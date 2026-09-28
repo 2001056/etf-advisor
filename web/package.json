@@ -32,6 +32,7 @@
     "check:purchase-guard": "tsx scripts/check-purchase-guard.ts",
     "check:holding-roles": "tsx scripts/check-holding-roles.ts",
     "check:holding-roles-db": "tsx scripts/check-holding-roles-db.ts",
+    "check:form-parse": "tsx scripts/check-form-parse.ts",
     "check:quotes": "tsx scripts/check-quotes.ts",
     "check:guard": "tsx scripts/check-guard.ts"
   },
