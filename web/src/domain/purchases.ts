@@ -1,12 +1,21 @@
-import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { ledger, purchases, recommendations, sales } from "@/db/schema";
 import { Category, CATEGORY_LABEL, dateKeyKST } from "./money";
-import { getHoldingRoleOverrides } from "./ledger";
-import { GrowthRole, mergeHoldingRoles, toGrowthRole } from "./recommendation";
-
-/** db.transaction 콜백이 받는 트랜잭션 핸들 타입 — *Tx 코어 함수들이 공유한다. */
-type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+import {
+  applyHoldingRoleChangesTx,
+  clearHoldingRolesTx,
+  getHoldingRoleOverrides,
+  lockHoldingRolesTx,
+  Tx,
+} from "./ledger";
+import {
+  GROWTH_ROLE_LABEL,
+  GrowthRole,
+  mergeHoldingRoles,
+  ROLE_CATEGORY,
+  toGrowthRole,
+} from "./recommendation";
 
 export type PurchaseInput = {
   boughtAt: string; // YYYY-MM-DD
@@ -46,7 +55,105 @@ async function insertPurchaseTx(tx: Tx, input: PurchaseInput, amount: number) {
       memo: input.memo ?? null,
     })
     .returning();
+
+  // 자리를 가진 추천으로 샀으면 그 자리가 이 종목의 자리다 — 예전 수동 지정이 이기지 않게 지운다
+  if (row.recommendationId !== null && row.category === ROLE_CATEGORY) {
+    const [rec] = await tx
+      .select({ role: recommendations.role })
+      .from(recommendations)
+      .where(eq(recommendations.id, row.recommendationId))
+      .limit(1);
+    if (toGrowthRole(rec?.role)) {
+      await clearHoldingRolesTx(tx, [`${row.category}::${row.ticker}`]);
+    }
+  }
   return row;
+}
+
+/** (카테고리, 종목) 보유 수량 — 트랜잭션 안에서 purchases − sales 로 파생 */
+async function heldQtyTx(tx: Tx, category: Category, ticker: string) {
+  const [bought] = await tx
+    .select({ qty: sql<number>`coalesce(sum(${purchases.qty}), 0)::int` })
+    .from(purchases)
+    .where(and(eq(purchases.category, category), eq(purchases.ticker, ticker)));
+  const [sold] = await tx
+    .select({ qty: sql<number>`coalesce(sum(${sales.qty}), 0)::int` })
+    .from(sales)
+    .where(and(eq(sales.category, category), eq(sales.ticker, ticker)));
+  return Number(bought?.qty ?? 0) - Number(sold?.qty ?? 0);
+}
+
+/**
+ * 보유가 0이 된 종목의 자리 수동 지정을 같은 트랜잭션에서 지운다 (자리를 두는 카테고리만).
+ * 판 종목의 옛 자리가 남으면 설정 화면(보유 종목만 보인다)에 보이지 않은 채
+ * 나중에 다시 샀을 때 새 추천 자리를 이긴다.
+ */
+async function dropSeatsOfEmptyHoldingsTx(
+  tx: Tx,
+  slots: { category: Category; ticker: string }[],
+) {
+  const keys = new Set<string>();
+  for (const s of slots) {
+    if (s.category !== ROLE_CATEGORY) continue;
+    if ((await heldQtyTx(tx, s.category, s.ticker)) <= 0) {
+      keys.add(`${s.category}::${s.ticker}`);
+    }
+  }
+  await clearHoldingRolesTx(tx, [...keys]);
+}
+
+/** 지금 자리 = 수동 지정 ?? 추천으로 산 가장 최근 매입의 자리 — holdingRoles 와 같은 규칙을 트랜잭션 안에서 */
+async function effectiveSeatTx(
+  tx: Tx,
+  category: Category,
+  ticker: string,
+): Promise<GrowthRole | null> {
+  const overrides = await lockHoldingRolesTx(tx);
+  const manual = overrides[`${category}::${ticker}`];
+  if (manual) return manual;
+  const rows = await tx
+    .select({ role: recommendations.role })
+    .from(purchases)
+    .innerJoin(recommendations, eq(purchases.recommendationId, recommendations.id))
+    .where(
+      and(
+        eq(purchases.category, category),
+        eq(purchases.ticker, ticker),
+        isNotNull(recommendations.role),
+      ),
+    )
+    .orderBy(desc(purchases.boughtAt), desc(purchases.id));
+  for (const r of rows) {
+    const role = toGrowthRole(r.role);
+    if (role) return role;
+  }
+  return null;
+}
+
+/**
+ * 매입·갈아타기 폼에서 고른 자리 확인 — 트랜잭션 맨 앞에서, 아무것도 쓰기 전에 부른다.
+ * 폼은 아직 자리가 없는 종목에만 자리를 붙인다(이미 있는 자리를 바꾸는 건 설정 화면).
+ * 이미 자리가 있는데 다른 값이면 거부하고, 같은 값이면 쓸 것이 없다. 새로 써야 하면 true.
+ */
+async function formSeatNeedsWriteTx(
+  tx: Tx,
+  category: Category,
+  ticker: string,
+  role: GrowthRole | null,
+): Promise<boolean> {
+  if (!role) return false;
+  if (category !== ROLE_CATEGORY) {
+    throw new Error(
+      `자리는 ${CATEGORY_LABEL[ROLE_CATEGORY]} 매수에만 지정할 수 있습니다`,
+    );
+  }
+  const existing = await effectiveSeatTx(tx, category, ticker);
+  if (existing && existing !== role) {
+    throw new Error(
+      `${ticker}는 이미 ${GROWTH_ROLE_LABEL[existing]} 자리입니다 — 자리는 설정 화면에서 바꾸세요`,
+    );
+  }
+  return !existing;
 }
 
 async function insertPurchaseLedgerTx(
@@ -96,14 +203,24 @@ export async function addPurchase(input: PurchaseInput) {
  * - 허용을 켜면 잔액이 음수가 될 수 있다 — 고배당 건너뜀 달의 재배분 매입을
  *   수기로 넣는 경우가 그렇다. 추천 수락 경로(addPurchaseWithHighDivTransfer)와 달리
  *   여기서는 고배당에서 옮겨오지 않는다.
+ * - role(자리)은 아직 자리가 없는 종목에만 붙고, 매입과 같은 트랜잭션에 저장된다 —
+ *   매입이 실패하면 자리도 남지 않는다.
  */
 export async function addManualPurchase(
   input: PurchaseInput,
-  opts: { allowOverBalance: boolean },
+  opts: { allowOverBalance: boolean; role?: GrowthRole | null },
 ) {
   const amount = input.qty * input.unitPrice;
+  const role = opts.role ?? null;
 
   return db.transaction(async (tx) => {
+    const writeSeat = await formSeatNeedsWriteTx(
+      tx,
+      input.category,
+      input.ticker.trim(),
+      role,
+    );
+
     if (!input.skipLedger && !opts.allowOverBalance) {
       const [row] = await tx
         .select({
@@ -120,7 +237,13 @@ export async function addManualPurchase(
       }
     }
 
-    return addPurchaseTx(tx, input);
+    const row = await addPurchaseTx(tx, input);
+    if (writeSeat && role) {
+      await applyHoldingRoleChangesTx(tx, [
+        { category: input.category, ticker: row.ticker, role },
+      ]);
+    }
+    return row;
   });
 }
 
@@ -287,11 +410,27 @@ export async function addPurchaseWithTransferTx(
   return row;
 }
 
+export const SWITCH_EDIT_MESSAGE =
+  "갈아타기 묶음의 매입은 개별 수정할 수 없습니다. 갈아타기 화면에서 묶음을 취소하세요";
+
 /** 매입 수정 — 연결된 원장 행을 같은 트랜잭션에서 함께 고친다. */
 export async function updatePurchase(id: number, input: PurchaseInput) {
   const amount = input.qty * input.unitPrice;
 
   return db.transaction(async (tx) => {
+    const [before] = await tx
+      .select({
+        switchGroupId: purchases.switchGroupId,
+        category: purchases.category,
+        ticker: purchases.ticker,
+      })
+      .from(purchases)
+      .where(eq(purchases.id, id))
+      .limit(1);
+    if (!before) throw new Error(`매입 기록 ${id}를 찾을 수 없습니다`);
+    // 갈아타기 매수는 매도·매도대금 이전과 한 묶음이다 — 카테고리·금액만 바꾸면 이전 쌍이 따로 논다
+    if (before.switchGroupId) throw new Error(SWITCH_EDIT_MESSAGE);
+
     const [row] = await tx
       .update(purchases)
       .set({
@@ -320,6 +459,9 @@ export async function updatePurchase(id: number, input: PurchaseInput) {
       })
       .where(and(eq(ledger.refPurchaseId, id), eq(ledger.type, "purchase")));
 
+    // 종목·구분을 바꿔 옛 종목 보유가 0이 됐으면 그 자리 지정도 지운다
+    await dropSeatsOfEmptyHoldingsTx(tx, [before]);
+
     return row;
   });
 }
@@ -330,7 +472,11 @@ export const SWITCH_DELETE_MESSAGE =
 export async function deletePurchase(id: number) {
   await db.transaction(async (tx) => {
     const [row] = await tx
-      .select({ switchGroupId: purchases.switchGroupId })
+      .select({
+        switchGroupId: purchases.switchGroupId,
+        category: purchases.category,
+        ticker: purchases.ticker,
+      })
       .from(purchases)
       .where(eq(purchases.id, id))
       .limit(1);
@@ -340,6 +486,7 @@ export async function deletePurchase(id: number) {
 
     await tx.delete(ledger).where(eq(ledger.refPurchaseId, id));
     await tx.delete(purchases).where(eq(purchases.id, id));
+    if (row) await dropSeatsOfEmptyHoldingsTx(tx, [row]);
   });
 }
 
@@ -348,7 +495,7 @@ export async function deletePurchase(id: number) {
  *
  * 잔액은 원장 SUM 파생이므로 행을 지우면 실행 전 값으로 그대로 돌아간다.
  * 카테고리를 넘은 갈아타기의 매도대금 이전(adjust 쌍)도 refPurchaseId 로 매입에 달려 있어
- * 함께 지워지고, 잔액 음수 확인은 매도·매수 두 카테고리 모두에 적용된다.
+ * 함께 지워지고, 잔액 음수 확인은 지우는 원장 행이 걸친 모든 카테고리에 적용된다.
  * 다만 매수분을 되돌리면 보유가 줄어드는데, 그 뒤 같은 종목을 또 팔았다면 보유가
  * 음수가 되므로 그 경우에는 거부한다.
  */
@@ -396,6 +543,20 @@ export async function cancelSwitch(groupId: string) {
 
     const buyIds = buys.map((r) => r.id);
     const sellIds = sells.map((r) => r.id);
+
+    // 잔액이 바뀌는 카테고리 = 지울 원장 행의 카테고리. 매수·매도 행의 지금 카테고리로 세면
+    // 고배당·매도대금 이전 쌍이나, 매입 행과 원장 행의 카테고리가 어긋난 옛 기록을 놓친다.
+    const refs = [
+      ...(buyIds.length ? [inArray(ledger.refPurchaseId, buyIds)] : []),
+      ...(sellIds.length ? [inArray(ledger.refSaleId, sellIds)] : []),
+    ];
+    const touched = (
+      await tx
+        .selectDistinct({ category: ledger.category })
+        .from(ledger)
+        .where(or(...refs))
+    ).map((r) => r.category);
+
     if (buyIds.length) {
       await tx.delete(ledger).where(inArray(ledger.refPurchaseId, buyIds));
     }
@@ -404,10 +565,11 @@ export async function cancelSwitch(groupId: string) {
     }
     await tx.delete(purchases).where(eq(purchases.switchGroupId, groupId));
     await tx.delete(sales).where(eq(sales.switchGroupId, groupId));
+    // 이 묶음으로 처음 산 종목은 되돌리면 보유가 0이 된다 — 그때 붙인 자리 지정도 지운다
+    await dropSeatsOfEmptyHoldingsTx(tx, buys);
 
     // 매도대금을 이미 다른 매입에 써버렸다면 되돌릴 재원이 없다 — 지운 뒤 잔액으로 확인하고
     // 음수면 던져서 트랜잭션째 되돌린다.
-    const touched = [...new Set([...buys, ...sells].map((r) => r.category))];
     for (const c of touched) {
       const [row] = await tx
         .select({
@@ -541,6 +703,11 @@ export async function addSaleTx(tx: Tx, input: SaleInput) {
       memo: `${etfName} ${qty}주 매도`,
     });
 
+    // 전량 매도(갈아타기 매도 포함)면 그 종목의 자리 지정도 여기서 끝난다
+    if (qty === heldQty) {
+      await dropSeatsOfEmptyHoldingsTx(tx, [{ category: input.category, ticker }]);
+    }
+
     return row;
   }
 }
@@ -566,6 +733,8 @@ export type SwitchInput = {
   recommendationId?: number | null;
   memo?: string | null;
   allowHighDivTransfer?: boolean;
+  // 새로 사는 종목의 자리(폼에서 고른 값). 아직 자리가 없는 종목에만 붙는다
+  role?: GrowthRole | null;
 };
 
 /**
@@ -582,10 +751,20 @@ export async function executeSwitch(input: SwitchInput) {
     throw new Error("같은 종목으로는 갈아탈 수 없습니다");
   }
   const date = input.executedAt ?? dateKeyKST();
-  const switchGroupId = `sw-${Date.now()}`;
+  // 같은 밀리초에 두 번 실행해도 묶음이 섞이지 않게 난수를 붙인다
+  const switchGroupId = `sw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const buyCategory = input.buyCategory ?? input.category;
+  const role = input.role ?? null;
 
   return db.transaction(async (tx) => {
+    // 자리 확인은 아무것도 쓰기 전에 — 다른 자리를 고르면 매도도 남기지 않고 거부한다
+    const writeSeat = await formSeatNeedsWriteTx(
+      tx,
+      buyCategory,
+      input.buy.ticker.trim(),
+      role,
+    );
+
     const sale = await addSaleTx(tx, {
       soldAt: date,
       category: input.category,
@@ -647,6 +826,12 @@ export async function executeSwitch(input: SwitchInput) {
         .update(ledger)
         .set({ refPurchaseId: purchase.id })
         .where(inArray(ledger.id, moved.map((r) => r.id)));
+    }
+
+    if (writeSeat && role) {
+      await applyHoldingRoleChangesTx(tx, [
+        { category: buyCategory, ticker: purchase.ticker, role },
+      ]);
     }
 
     return { switchGroupId, sale, purchase };

@@ -238,7 +238,7 @@ export const purchases = pgTable(
       () => recommendations.id,
     ),
     // 갈아타기 묶음: 같은 값을 가진 sales 1행 + purchases 1행이 한 번의 교체(매도→매수)다.
-    // 일반 매수는 NULL. 형식은 actionId 관례를 따라 "sw-<timestamp>".
+    // 일반 매수는 NULL. 형식은 actionId 관례를 따라 "sw-<timestamp>-<난수>" (예전 기록은 "sw-<timestamp>").
     switchGroupId: text("switch_group_id"),
     memo: text("memo"),
     createdAt: timestamp("created_at", { withTimezone: true })

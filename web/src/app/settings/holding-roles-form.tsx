@@ -21,7 +21,7 @@ const SOURCE_LABEL = {
 } as const;
 
 /**
- * 보유 종목마다 자리(공격·안정)를 정한다. 바꾼 줄만 저장된다.
+ * 보유 종목마다 자리(공격·안정)를 정한다. 화면을 그릴 때 값에서 바꾼 줄만 저장된다.
  * 추천 없이 산 종목은 여기서 정해야 ④·⑤와 대시보드가 자리를 안다.
  */
 export default function HoldingRolesForm({
@@ -61,6 +61,8 @@ export default function HoldingRolesForm({
                 {r.source && ` · ${SOURCE_LABEL[r.source]}`}
               </span>
             </span>
+            {/* 화면을 그릴 때의 값 — 서버는 이것과 다른 줄만 저장한다 */}
+            <input type="hidden" name={`orig:${r.key}`} value={r.role} />
             <select
               name={`seat:${r.key}`}
               defaultValue={r.role}

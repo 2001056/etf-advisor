@@ -22,6 +22,9 @@ const TOPUP_KEY = "monthly_topup";
 const GROWTH_ROLES_KEY = "growth_roles";
 const HOLDING_ROLES_KEY = "holding_roles";
 
+/** db.transaction 콜백이 받는 트랜잭션 핸들 타입 — *Tx 코어 함수들이 공유한다. */
+export type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
 /** 카테고리별 잔액. 저장하지 않고 항상 원장 합계로 파생한다 (§7). */
 export async function getBalances(): Promise<Record<Category, number>> {
   const rows = await db
@@ -108,8 +111,38 @@ export type HoldingRoleChange = {
   role: GrowthRole | null; // null = 수동 지정을 지운다 (추천에서 온 자리가 있으면 그 자리로 돌아간다)
 };
 
-/** 여러 종목의 자리를 한 번에 바꾼다 — 설정 화면 저장이 일부만 반영되지 않게 한 트랜잭션으로 */
-export async function setHoldingRoles(changes: HoldingRoleChange[]): Promise<void> {
+/**
+ * holding_roles 행을 잠그고 읽는다. 행이 아직 없으면 빈 값으로 먼저 만든다 —
+ * 없는 행에는 FOR UPDATE 가 걸리지 않아, 첫 저장 두 건이 동시에 오면 한쪽 키가 사라진다.
+ * 동시에 만든 쪽은 on conflict 에서 앞 트랜잭션이 끝날 때까지 기다린 뒤 최신 행을 잠근다.
+ */
+export async function lockHoldingRolesTx(
+  tx: Tx,
+): Promise<Record<string, GrowthRole>> {
+  await tx
+    .insert(settings)
+    .values({ key: HOLDING_ROLES_KEY, value: {} })
+    .onConflictDoNothing();
+  const [row] = await tx
+    .select()
+    .from(settings)
+    .where(eq(settings.key, HOLDING_ROLES_KEY))
+    .limit(1)
+    .for("update");
+  return normalizeHoldingRoles(row?.value);
+}
+
+async function writeHoldingRolesTx(
+  tx: Tx,
+  value: Record<string, GrowthRole>,
+): Promise<void> {
+  await tx
+    .update(settings)
+    .set({ value, updatedAt: new Date() })
+    .where(eq(settings.key, HOLDING_ROLES_KEY));
+}
+
+function assertHoldingRoleChanges(changes: HoldingRoleChange[]): void {
   for (const c of changes) {
     if (c.category !== ROLE_CATEGORY) {
       throw new Error(
@@ -118,29 +151,40 @@ export async function setHoldingRoles(changes: HoldingRoleChange[]): Promise<voi
     }
     if (!c.ticker.trim()) throw new Error("자리를 지정할 종목코드가 비어 있습니다");
   }
-  if (!changes.length) return;
+}
 
-  await db.transaction(async (tx) => {
-    const [row] = await tx
-      .select()
-      .from(settings)
-      .where(eq(settings.key, HOLDING_ROLES_KEY))
-      .limit(1)
-      .for("update");
-    const value = normalizeHoldingRoles(row?.value);
-    for (const c of changes) {
-      const key = `${c.category}::${c.ticker.trim()}`;
-      if (c.role) value[key] = c.role;
-      else delete value[key];
-    }
-    await tx
-      .insert(settings)
-      .values({ key: HOLDING_ROLES_KEY, value })
-      .onConflictDoUpdate({
-        target: settings.key,
-        set: { value, updatedAt: new Date() },
-      });
-  });
+/** 주어진 트랜잭션 안에서 자리를 바꾼다 — 매입과 같은 트랜잭션이면 매입이 실패할 때 자리도 남지 않는다 */
+export async function applyHoldingRoleChangesTx(
+  tx: Tx,
+  changes: HoldingRoleChange[],
+): Promise<void> {
+  assertHoldingRoleChanges(changes);
+  if (!changes.length) return;
+  const value = await lockHoldingRolesTx(tx);
+  for (const c of changes) {
+    const key = `${c.category}::${c.ticker.trim()}`;
+    if (c.role) value[key] = c.role;
+    else delete value[key];
+  }
+  await writeHoldingRolesTx(tx, value);
+}
+
+/** 수동 지정을 지운다 — 보유가 0이 됐거나, 자리를 가진 추천으로 새로 산 종목 */
+export async function clearHoldingRolesTx(tx: Tx, keys: string[]): Promise<void> {
+  if (!keys.length) return;
+  const value = await lockHoldingRolesTx(tx);
+  const hit = keys.filter((k) => k in value);
+  if (!hit.length) return;
+  for (const k of hit) delete value[k];
+  await writeHoldingRolesTx(tx, value);
+}
+
+/** 여러 종목의 자리를 한 번에 바꾼다 — 설정 화면 저장이 일부만 반영되지 않게 한 트랜잭션으로 */
+export async function setHoldingRoles(changes: HoldingRoleChange[]): Promise<void> {
+  // 트랜잭션을 열기 전에 전부 확인한다 — 하나라도 틀리면 아무것도 쓰지 않는다
+  assertHoldingRoleChanges(changes);
+  if (!changes.length) return;
+  await db.transaction((tx) => applyHoldingRoleChangesTx(tx, changes));
 }
 
 export async function setHoldingRole(

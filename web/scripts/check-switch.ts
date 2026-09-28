@@ -24,6 +24,7 @@ import {
   executeSwitch,
   getHoldings,
   listPurchases,
+  updatePurchase,
 } from "../src/domain/purchases";
 import { allocateBudgets, computeRefQty } from "../src/domain/recommendation";
 import { guardAgainstRealData } from "./lib/guard";
@@ -725,6 +726,116 @@ async function main() {
   check("취소 후 고배당 이전 행 0건", await transferRowCount(), 0);
   check("취소 후 매도대금 이전 행 0건", await switchMoveRowCount(), 0);
   check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log("\n=== 시나리오 12: 갈아타기 매수는 개별 수정할 수 없다 ===");
+  await reset({ div_growth: 200_000, asset_growth: 50_000, high_div: 0 });
+  await seedDivHolding();
+  const sw12 = await executeSwitch(crossInput);
+  const rows12 = await groupLedgerRows(sw12.switchGroupId);
+  const bal12 = await getBalances();
+  const editMsg = await messageOf(() =>
+    updatePurchase(sw12.purchase.id, {
+      boughtAt: "2026-09-16",
+      category: "high_div",
+      ticker: "133690",
+      etfName: "합성 성장 ETF",
+      qty: 15,
+      unitPrice: 10_000,
+    }),
+  );
+  check(
+    "거부 메시지",
+    editMsg,
+    "갈아타기 묶음의 매입은 개별 수정할 수 없습니다. 갈아타기 화면에서 묶음을 취소하세요",
+  );
+  check("묶음 원장 그대로", await groupLedgerRows(sw12.switchGroupId), rows12);
+  check("매수 행 카테고리 그대로", (await listPurchases()).find((p) => p.id === sw12.purchase.id)?.category, "asset_growth");
+  check("잔액 불변", await getBalances(), bal12);
+
+  console.log("\n--- 대조군: 일반 매입은 그대로 수정된다 ---");
+  const plain12 = await addPurchase({
+    boughtAt: "2026-09-18",
+    category: "asset_growth",
+    ticker: "446720",
+    etfName: "합성 분산 ETF",
+    qty: 1,
+    unitPrice: 10_000,
+  });
+  check(
+    "예외 없음",
+    await messageOf(() =>
+      updatePurchase(plain12.id, {
+        boughtAt: "2026-09-18",
+        category: "asset_growth",
+        ticker: "446720",
+        etfName: "합성 분산 ETF",
+        qty: 2,
+        unitPrice: 10_000,
+      }),
+    ),
+    null,
+  );
+  check("수정된 금액이 원장에 반영", await ledgerRefCount(plain12.id), 1);
+  check("자산성장 잔액 = 2만 − 2만", (await getBalances()).asset_growth, 0);
+
+  console.log(
+    "\n=== 시나리오 13: 취소 시 잔액 확인은 지울 원장 행의 카테고리로 한다 ===",
+  );
+  // 수정 막기 전의 옛 기록 재현: 갈아타기 매수 행(과 그 purchase 원장 행)만 고배당으로 옮겨져
+  // 매도대금 이전(+P)은 자산성장에 남은 상태. 매수·매도 행의 카테고리는 배당성장·고배당뿐이다.
+  await reset({ div_growth: 200_000, asset_growth: 50_000, high_div: 0 });
+  await seedDivHolding();
+  const sw13 = await executeSwitch(crossInput);
+  await db.execute(
+    sql`update purchases set category = 'high_div' where id = ${sw13.purchase.id}`,
+  );
+  await db.execute(
+    sql`update ledger set category = 'high_div' where ref_purchase_id = ${sw13.purchase.id} and type = 'purchase'`,
+  );
+  check("재현 후 자산성장 잔액 = 5만 + 이전 12만", (await getBalances()).asset_growth, 170_000);
+  // 자산성장에 남은 17만을 다 쓴다 → 취소하면 이전 +12만이 빠져 자산성장이 음수
+  const spender13 = await addPurchase({
+    boughtAt: "2026-09-18",
+    category: "asset_growth",
+    ticker: "446720",
+    etfName: "합성 분산 ETF",
+    qty: 17,
+    unitPrice: 10_000,
+  });
+  const bal13 = await getBalances();
+  check(
+    "거부 메시지(매수·매도 행에 없는 자산성장)",
+    await messageOf(() => cancelSwitch(sw13.switchGroupId)),
+    "취소하면 자산성장 잔액이 120,000원 음수가 됩니다. 먼저 다른 매입을 정리하세요",
+  );
+  check("묶음 원장 4행 그대로", await groupLedgerCount(sw13.switchGroupId), 4);
+  check("잔액 불변", await getBalances(), bal13);
+
+  console.log("\n--- 대조군: 쓴 매입을 정리하면 같은 취소가 통과한다 ---");
+  await deletePurchase(spender13.id);
+  check("예외 없음", await messageOf(() => cancelSwitch(sw13.switchGroupId)), null);
+  check("잔액 복원", await getBalances(), {
+    div_growth: 0,
+    asset_growth: 50_000,
+    high_div: 0,
+  });
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log("\n=== 시나리오 14: 같은 밀리초에 실행해도 묶음 id 가 겹치지 않는다 ===");
+  await reset({ div_growth: 200_000, asset_growth: 0, high_div: 0 });
+  await seedDivHolding();
+  const pairIds = await Promise.all(
+    [0, 1].map((i) =>
+      executeSwitch({
+        category: "div_growth",
+        executedAt: "2026-09-16",
+        sell: { ticker: "251350", qty: 1, unitPrice: 10_000 },
+        buy: { ticker: i ? "446720" : "133690", etfName: "합성", qty: 1, unitPrice: 10_000 },
+      }).then((r) => r.switchGroupId),
+    ),
+  );
+  check("두 묶음 id 가 다르다", pairIds[0] !== pairIds[1], true);
+  check("형식 sw-<시각>-<난수>", pairIds.every((g) => /^sw-\d+-[a-z0-9]+$/.test(g)), true);
 
   await db.execute(
     sql`truncate ${ledger}, ${purchases}, ${sales}, ${purchaseCycles}, ${settings}, ${recommendations}, ${agentRuns} restart identity cascade`,
