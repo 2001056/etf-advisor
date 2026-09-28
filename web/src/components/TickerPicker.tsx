@@ -27,6 +27,7 @@ export default function TickerPicker({
   tickerName = "ticker",
   etfNameName = "etfName",
   categoryName,
+  onCategoryPicked,
   label = "종목",
 }: {
   candidates: Candidate[];
@@ -34,6 +35,8 @@ export default function TickerPicker({
   etfNameName?: string;
   /** 지정하면 고를 때 이 이름의 select/hidden 값도 함께 맞춘다 */
   categoryName?: string;
+  /** 위에서 구분을 맞췄을 때 알려준다 — DOM 값만 바꾸면 change 이벤트가 나지 않는다 */
+  onCategoryPicked?: (category: string) => void;
   label?: string;
 }) {
   const [query, setQuery] = useState("");
@@ -77,6 +80,7 @@ export default function TickerPicker({
       const form = boxRef.current?.closest("form");
       const sel = form?.elements.namedItem(categoryName);
       if (sel instanceof HTMLSelectElement) sel.value = c.category;
+      onCategoryPicked?.(c.category);
     }
   };
 

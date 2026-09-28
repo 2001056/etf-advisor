@@ -11,6 +11,11 @@ import {
   formatKRW,
   monthKeyKST,
 } from "@/domain/money";
+import {
+  GROWTH_ROLES,
+  GROWTH_ROLE_LABEL,
+  ROLE_CATEGORY,
+} from "@/domain/recommendation";
 import { buttonClass, Card, Notice, Page } from "@/components/ui";
 import PurchaseForm from "./form";
 import DeletePurchaseButton from "./delete";
@@ -39,6 +44,11 @@ export default async function PurchasesPage() {
             label: `${CATEGORY_LABEL[c]} (잔액 ${formatKRW(balances[c as Category])})`,
           }))}
           candidates={candidates}
+          roleCategory={ROLE_CATEGORY}
+          roleOptions={GROWTH_ROLES.map((r) => ({
+            value: r,
+            label: GROWTH_ROLE_LABEL[r],
+          }))}
         />
       </Card>
 

@@ -62,6 +62,35 @@ export function normalizeRoleWeights(raw: unknown): Record<GrowthRole, number> {
   ) as Record<GrowthRole, number>;
 }
 
+/**
+ * 보유 종목 자리 수동 지정(settings.holding_roles)을 읽을 수 있는 값으로 만든다.
+ * 키는 `카테고리::종목코드`, 값은 자리. 자리를 두는 카테고리(자산성장)의 키와
+ * 올바른 자리 문자열만 남기고 나머지는 버린다 — 깨진 값 하나가 ⑤ 통합 판단을 흔들면 안 된다.
+ */
+export function normalizeHoldingRoles(raw: unknown): Record<string, GrowthRole> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, GrowthRole> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const sep = key.indexOf("::");
+    if (sep < 0 || key.slice(0, sep) !== ROLE_CATEGORY) continue;
+    const ticker = key.slice(sep + 2).trim();
+    if (!ticker || typeof value !== "string") continue;
+    const role = toGrowthRole(value);
+    if (role) out[`${ROLE_CATEGORY}::${ticker}`] = role;
+  }
+  return out;
+}
+
+/** 추천에서 거슬러 올라간 자리 위에 수동 지정을 덮는다 — 같은 종목이면 수동 지정이 이긴다 */
+export function mergeHoldingRoles(
+  derived: Map<string, GrowthRole>,
+  overrides: Record<string, GrowthRole>,
+): Map<string, GrowthRole> {
+  const out = new Map(derived);
+  for (const [key, role] of Object.entries(overrides)) out.set(key, role);
+  return out;
+}
+
 /** 활성 = 설정 화면의 월 충전액 > 0. 잔액은 보지 않는다 — 갈아타기 차액·분배금 같은 잔돈이 비활성 카테고리를 되살리면 안 된다 */
 export function activeCategories(topup: Record<Category, number>): Category[] {
   const active = CATEGORIES.filter((c) => (topup[c] ?? 0) > 0);

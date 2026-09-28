@@ -1,12 +1,14 @@
 "use client";
 
-import { useActionState } from "react";
+import { useActionState, useState } from "react";
 import { addPurchaseAction } from "../actions";
 import { buttonClass, Field, inputClass } from "@/components/ui";
 import TickerPicker, { Candidate } from "@/components/TickerPicker";
 
 /** seq: 성공 횟수 — 폼을 다시 그려 비우는 key 로 쓴다 */
 type State = { ok?: true; error?: string; seq?: number } | null;
+
+type Option = { value: string; label: string };
 
 /**
  * 수기 매입 폼. 잔액 초과·빈칸 같은 입력 오류는 서버 예외 화면이 아니라
@@ -16,16 +18,25 @@ export default function PurchaseForm({
   today,
   categories,
   candidates,
+  roleCategory,
+  roleOptions,
 }: {
   today: string;
-  categories: { value: string; label: string }[];
+  categories: Option[];
   candidates: Candidate[];
+  /** 자리(공격·안정)를 두는 카테고리 — 이 구분일 때만 자리 칸을 보인다 */
+  roleCategory: string;
+  roleOptions: Option[];
 }) {
+  // 구분 select 는 종목 검색이 DOM 값으로 바꾸기도 하므로 제어하지 않고, 지금 값만 따라간다
+  const [cat, setCat] = useState(categories[0]?.value ?? "");
   // 수기 매입에는 추천 유니크가 없다 — 성공하면 seq 를 올려 폼을 새로 그린다.
   // "추가"를 한 번 더 눌러 같은 건이 그대로 다시 기록되는 것을 막는다.
   const [state, action, pending] = useActionState<State, FormData>(
     async (prev, fd) => {
       const res = (await addPurchaseAction(fd)) ?? null;
+      // 새로 그린 폼의 구분 select 는 첫 항목으로 돌아가므로 따라 맞춘다
+      if (res?.ok) setCat(categories[0]?.value ?? "");
       return { ...res, seq: (prev?.seq ?? 0) + (res?.ok ? 1 : 0) };
     },
     null,
@@ -47,7 +58,12 @@ export default function PurchaseForm({
         />
       </Field>
       <Field label="구분">
-        <select name="category" required className={inputClass}>
+        <select
+          name="category"
+          required
+          onChange={(e) => setCat(e.target.value)}
+          className={inputClass}
+        >
           {categories.map((c) => (
             <option key={c.value} value={c.value}>
               {c.label}
@@ -56,8 +72,27 @@ export default function PurchaseForm({
         </select>
       </Field>
       <div className="sm:col-span-2">
-        <TickerPicker candidates={candidates} categoryName="category" />
+        <TickerPicker
+          candidates={candidates}
+          categoryName="category"
+          onCategoryPicked={setCat}
+        />
       </div>
+      {cat === roleCategory && (
+        <Field
+          label="자리 (선택)"
+          hint="고르면 이 종목의 자리로 저장됩니다. 설정 화면에서도 바꿀 수 있습니다"
+        >
+          <select name="role" defaultValue="" className={inputClass}>
+            <option value="">지정 안 함</option>
+            {roleOptions.map((r) => (
+              <option key={r.value} value={r.value}>
+                {r.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
       <Field label="수량(주)">
         <input name="qty" type="number" min={1} required className={inputClass} />
       </Field>

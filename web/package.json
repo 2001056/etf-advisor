@@ -30,6 +30,8 @@
     "check:accept": "tsx scripts/check-accept.ts",
     "check:switch": "tsx scripts/check-switch.ts",
     "check:purchase-guard": "tsx scripts/check-purchase-guard.ts",
+    "check:holding-roles": "tsx scripts/check-holding-roles.ts",
+    "check:holding-roles-db": "tsx scripts/check-holding-roles-db.ts",
     "check:quotes": "tsx scripts/check-quotes.ts",
     "check:guard": "tsx scripts/check-guard.ts"
   },

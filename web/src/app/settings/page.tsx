@@ -1,4 +1,9 @@
-import { getGrowthRoleWeights, getMonthlyTopup } from "@/domain/ledger";
+import {
+  getGrowthRoleWeights,
+  getHoldingRoleOverrides,
+  getMonthlyTopup,
+} from "@/domain/ledger";
+import { getHoldings, holdingRoles } from "@/domain/purchases";
 import {
   CATEGORIES,
   CATEGORY_LABEL,
@@ -16,20 +21,43 @@ import { Card, Notice, Page } from "@/components/ui";
 import PromptForm from "./prompt-form";
 import TopupForm from "./topup-form";
 import GrowthRolesForm from "./growth-roles-form";
+import HoldingRolesForm from "./holding-roles-form";
 
 export const dynamic = "force-dynamic";
 
 const SLOTS: PromptSlot[] = ["weekly", "purchase", "recommend"];
 
 export default async function SettingsPage() {
-  const [topup, prompts, roleWeights] = await Promise.all([
-    getMonthlyTopup(),
-    getAllPrompts(),
-    getGrowthRoleWeights(),
-  ]);
+  const [topup, prompts, roleWeights, holdings, roles, overrides] =
+    await Promise.all([
+      getMonthlyTopup(),
+      getAllPrompts(),
+      getGrowthRoleWeights(),
+      getHoldings(),
+      holdingRoles(),
+      getHoldingRoleOverrides(),
+    ]);
   const total = CATEGORIES.reduce((s, c) => s + topup[c], 0);
   // 전부 0이면 세 카테고리 모두 활성이라 충전액 0만으로는 비활성이 아니다
   const roleActive = activeCategories(topup).includes(ROLE_CATEGORY);
+  const seatRows = holdings
+    .filter((h) => h.category === ROLE_CATEGORY)
+    .map((h) => {
+      const key = `${h.category}::${h.ticker}`;
+      return {
+        key,
+        ticker: h.ticker,
+        etfName: h.etfName,
+        qty: h.qty,
+        role: roles.get(key) ?? "",
+        source:
+          key in overrides
+            ? ("override" as const)
+            : roles.has(key)
+              ? ("recommendation" as const)
+              : null,
+      };
+    });
 
   return (
     <Page current="/settings">
@@ -69,6 +97,29 @@ export default async function SettingsPage() {
             GROWTH_ROLES.map((r) => [r, GROWTH_ROLE_HINT[r]]),
           )}
         />
+      </Card>
+
+      <Card title="보유 종목 자리">
+        <p className="mb-3 text-sm text-neutral-600">
+          추천 없이 산 {CATEGORY_LABEL[ROLE_CATEGORY]} 종목(갈아타기·수기 매입·자리
+          도입 전 매입)은 자리를 알 수 없어, 보유 점검·종목 정리가 두 종목을 같은
+          자리로 볼 수 있습니다. 여기서 정한 자리는 추천 기록보다 우선합니다.
+          미정은 직접 지정을 지우는 것이라, 추천으로 산 기록이 있으면 그 자리로
+          돌아갑니다.
+        </p>
+        {seatRows.length === 0 ? (
+          <p className="text-sm text-neutral-500">
+            {CATEGORY_LABEL[ROLE_CATEGORY]} 보유 종목이 없습니다.
+          </p>
+        ) : (
+          <HoldingRolesForm
+            rows={seatRows}
+            roleOptions={GROWTH_ROLES.map((r) => ({
+              value: r,
+              label: GROWTH_ROLE_LABEL[r],
+            }))}
+          />
+        )}
       </Card>
 
       <Notice>

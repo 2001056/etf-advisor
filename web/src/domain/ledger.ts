@@ -3,17 +3,24 @@ import { db } from "@/db";
 import { ledger, purchaseCycles, recommendations, settings } from "@/db/schema";
 import {
   CATEGORIES,
+  CATEGORY_LABEL,
   Category,
   DEFAULT_MONTHLY_TOPUP,
   monthKeyKST,
   monthsAfter,
   nextMonth,
 } from "./money";
-import { GrowthRole, normalizeRoleWeights } from "./recommendation";
+import {
+  GrowthRole,
+  normalizeHoldingRoles,
+  normalizeRoleWeights,
+  ROLE_CATEGORY,
+} from "./recommendation";
 
 const BASELINE_KEY = "topup_baseline_month";
 const TOPUP_KEY = "monthly_topup";
 const GROWTH_ROLES_KEY = "growth_roles";
+const HOLDING_ROLES_KEY = "holding_roles";
 
 /** 카테고리별 잔액. 저장하지 않고 항상 원장 합계로 파생한다 (§7). */
 export async function getBalances(): Promise<Record<Category, number>> {
@@ -77,6 +84,71 @@ export async function setGrowthRoleWeights(
       target: settings.key,
       set: { value, updatedAt: new Date() },
     });
+}
+
+/**
+ * 보유 종목 자리의 수동 지정. 키는 `카테고리::종목코드`.
+ * 추천 없이 산 종목(갈아타기·수기 매입·자리 도입 전 매입)은 여기서만 자리를 얻는다.
+ * 저장값이 깨져 있으면 자산성장 키·올바른 자리만 남기고 읽는다.
+ */
+export async function getHoldingRoleOverrides(): Promise<
+  Record<string, GrowthRole>
+> {
+  const row = await db
+    .select()
+    .from(settings)
+    .where(eq(settings.key, HOLDING_ROLES_KEY))
+    .limit(1);
+  return normalizeHoldingRoles(row[0]?.value);
+}
+
+export type HoldingRoleChange = {
+  category: Category;
+  ticker: string;
+  role: GrowthRole | null; // null = 수동 지정을 지운다 (추천에서 온 자리가 있으면 그 자리로 돌아간다)
+};
+
+/** 여러 종목의 자리를 한 번에 바꾼다 — 설정 화면 저장이 일부만 반영되지 않게 한 트랜잭션으로 */
+export async function setHoldingRoles(changes: HoldingRoleChange[]): Promise<void> {
+  for (const c of changes) {
+    if (c.category !== ROLE_CATEGORY) {
+      throw new Error(
+        `자리는 ${CATEGORY_LABEL[ROLE_CATEGORY]} 종목에만 지정할 수 있습니다 (${CATEGORY_LABEL[c.category]} ${c.ticker})`,
+      );
+    }
+    if (!c.ticker.trim()) throw new Error("자리를 지정할 종목코드가 비어 있습니다");
+  }
+  if (!changes.length) return;
+
+  await db.transaction(async (tx) => {
+    const [row] = await tx
+      .select()
+      .from(settings)
+      .where(eq(settings.key, HOLDING_ROLES_KEY))
+      .limit(1)
+      .for("update");
+    const value = normalizeHoldingRoles(row?.value);
+    for (const c of changes) {
+      const key = `${c.category}::${c.ticker.trim()}`;
+      if (c.role) value[key] = c.role;
+      else delete value[key];
+    }
+    await tx
+      .insert(settings)
+      .values({ key: HOLDING_ROLES_KEY, value })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value, updatedAt: new Date() },
+      });
+  });
+}
+
+export async function setHoldingRole(
+  category: Category,
+  ticker: string,
+  role: GrowthRole | null,
+): Promise<void> {
+  await setHoldingRoles([{ category, ticker, role }]);
 }
 
 async function getBaselineMonth(): Promise<string | null> {
