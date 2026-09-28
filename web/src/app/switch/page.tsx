@@ -1,8 +1,20 @@
 import { redirect } from "next/navigation";
-import { isOnboarded } from "@/domain/ledger";
+import { getBalances, getMonthlyTopup, isOnboarded } from "@/domain/ledger";
 import { getHoldings, listSales } from "@/domain/purchases";
 import { tickerCandidates } from "@/domain/tickers";
-import { CATEGORY_LABEL, Category, dateKeyKST } from "@/domain/money";
+import {
+  CATEGORIES,
+  CATEGORY_LABEL,
+  Category,
+  dateKeyKST,
+  formatKRW,
+} from "@/domain/money";
+import {
+  activeCategories,
+  GROWTH_ROLES,
+  GROWTH_ROLE_LABEL,
+  ROLE_CATEGORY,
+} from "@/domain/recommendation";
 import { Card, Page } from "@/components/ui";
 import SwitchForm from "./form";
 import CancelSwitchButton from "./cancel";
@@ -12,10 +24,12 @@ export const dynamic = "force-dynamic";
 export default async function SwitchPage() {
   if (!(await isOnboarded())) redirect("/onboarding");
 
-  const [holdings, candidates, sales] = await Promise.all([
+  const [holdings, candidates, sales, balances, topup] = await Promise.all([
     getHoldings(),
     tickerCandidates(),
     listSales(50),
+    getBalances(),
+    getMonthlyTopup(),
   ]);
 
   return (
@@ -27,6 +41,16 @@ export default async function SwitchPage() {
           today={dateKeyKST()}
           holdings={holdings}
           candidates={candidates}
+          categories={CATEGORIES.map((c) => ({
+            value: c,
+            label: `${CATEGORY_LABEL[c]} (잔액 ${formatKRW(balances[c])})`,
+          }))}
+          active={activeCategories(topup)}
+          roleCategory={ROLE_CATEGORY}
+          roleOptions={GROWTH_ROLES.map((r) => ({
+            value: r,
+            label: GROWTH_ROLE_LABEL[r],
+          }))}
         />
       </Card>
 

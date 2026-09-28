@@ -1,5 +1,6 @@
 /**
- * 갈아타기 묶음 삭제·취소·매수 잔액 검증 (§5 A3). 검증용 DB에서만 실행할 것 — 테이블을 비운다.
+ * 갈아타기 묶음 삭제·취소·매수 잔액·매수 카테고리 선택(매도대금 이전) 검증 (§5 A3).
+ * 검증용 DB에서만 실행할 것 — 테이블을 비운다.
  *   DATABASE_URL=<test db> pnpm exec tsx scripts/check-switch.ts
  */
 import { sql } from "drizzle-orm";
@@ -21,6 +22,7 @@ import {
   cancelSwitch,
   deletePurchase,
   executeSwitch,
+  getHoldings,
   listPurchases,
 } from "../src/domain/purchases";
 import { allocateBudgets, computeRefQty } from "../src/domain/recommendation";
@@ -76,6 +78,35 @@ async function transferRowCount() {
     sql`select count(*)::int as n from ledger where type='adjust' and memo like '고배당 건너뜀%'`,
   );
   return r.rows[0].n;
+}
+
+/** 갈아타기 매도대금 이전(adjust 쌍) 행 수 — 매수 카테고리를 바꿨을 때만 생긴다 */
+async function switchMoveRowCount() {
+  const r = await db.execute<{ n: number }>(
+    sql`select count(*)::int as n from ledger where type='adjust' and memo like '%갈아타기 매도대금%'`,
+  );
+  return r.rows[0].n;
+}
+
+/** 묶음에 달린 원장 행을 기록 순서대로 — 무엇이 어느 카테고리에 얼마로, 같은 ts 로 남았는지 본다 */
+async function groupLedgerRows(groupId: string) {
+  const r = await db.execute<{
+    type: string;
+    category: string;
+    amount: number;
+    ref: string;
+    memo: string;
+    ts: string;
+  }>(sql`select l.type, l.category, l.amount_krw as amount,
+      case when l.ref_sale_id is not null then 'sale'
+           when l.ref_purchase_id is not null then 'purchase'
+           else 'none' end as ref,
+      l.memo, l.ts::text as ts
+      from ledger l
+      where l.ref_purchase_id in (select id from purchases where switch_group_id = ${groupId})
+         or l.ref_sale_id in (select id from sales where switch_group_id = ${groupId})
+      order by l.id`);
+  return r.rows;
 }
 
 async function counts(groupId?: string) {
@@ -468,6 +499,231 @@ async function main() {
   check("취소 후 이전 행 0건", await transferRowCount(), 0);
   check("취소 후 묶음 원장 0행", await groupLedgerCount(sw7.switchGroupId), 0);
   check("취소 후 잔액 복원", await getBalances(), balSkipped);
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  // ── 매수 카테고리 선택 (종목·금액은 전부 합성 값) ──
+  const seedDivHolding = () =>
+    addPurchase({
+      boughtAt: "2026-09-01",
+      category: "div_growth",
+      ticker: "251350",
+      etfName: "합성 배당 ETF",
+      qty: 20,
+      unitPrice: 10_000,
+    });
+  // 배당성장 251350 10주를 12,000원에 팔아(대금 120,000) 자산성장 133690 을 산다
+  const crossInput = {
+    category: "div_growth" as const,
+    buyCategory: "asset_growth" as const,
+    executedAt: "2026-09-16",
+    sell: { ticker: "251350", qty: 10, unitPrice: 12_000 },
+    buy: {
+      ticker: "133690",
+      etfName: "합성 성장 ETF",
+      qty: 15,
+      unitPrice: 10_000,
+    },
+  };
+
+  console.log(
+    "\n=== 시나리오 8: 매수 카테고리를 바꾼 갈아타기 — 매도대금 전액이 매수 카테고리로 옮겨진다 ===",
+  );
+  await reset({ div_growth: 200_000, asset_growth: 50_000, high_div: 0 });
+  await seedDivHolding();
+  const balBeforeCross = await getBalances();
+  check("갈아타기 전 잔액", balBeforeCross, {
+    div_growth: 0,
+    asset_growth: 50_000,
+    high_div: 0,
+  });
+  const sw8 = await executeSwitch(crossInput);
+  check("매도 행은 매도 카테고리", sw8.sale.category, "div_growth");
+  check("매수 행은 매수 카테고리", sw8.purchase.category, "asset_growth");
+  const rows8 = await groupLedgerRows(sw8.switchGroupId);
+  check(
+    "묶음 원장 4행 (sell +P · adjust −P/+P · purchase −A)",
+    rows8.map((r) => [r.type, r.category, r.amount, r.ref, r.memo]),
+    [
+      ["sell", "div_growth", 120_000, "sale", "합성 배당 ETF 10주 매도"],
+      ["adjust", "div_growth", -120_000, "purchase", "갈아타기 매도대금 → 자산성장 이전"],
+      ["adjust", "asset_growth", 120_000, "purchase", "배당성장 갈아타기 매도대금 이전받음"],
+      ["purchase", "asset_growth", -150_000, "purchase", "합성 성장 ETF 15주"],
+    ],
+  );
+  check(
+    "이전 2행 + 매입 1행이 새 매입 id 를 가리킨다",
+    await ledgerRefCount(sw8.purchase.id),
+    3,
+  );
+  check("네 행의 ts 가 모두 같다", new Set(rows8.map((r) => r.ts)).size, 1);
+  check("잔액: 배당성장 0 · 자산성장 5만+12만−15만", await getBalances(), {
+    div_growth: 0,
+    asset_growth: 20_000,
+    high_div: 0,
+  });
+  check(
+    "보유: 배당성장 10주 남고 자산성장에 새 종목",
+    (await getHoldings()).map((h) => `${h.category}::${h.ticker} ${h.qty}주`).sort(),
+    ["asset_growth::133690 15주", "div_growth::251350 10주"],
+  );
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log(
+    "\n=== 시나리오 9: 카테고리를 넘은 갈아타기 취소 → 두 카테고리 잔액이 모두 돌아온다 ===",
+  );
+  const cancelled8 = await cancelSwitch(sw8.switchGroupId);
+  check("지운 행 수", cancelled8, { purchases: 1, sales: 1 });
+  check("이전 행 0건", await switchMoveRowCount(), 0);
+  check("묶음 원장 0행", await groupLedgerCount(sw8.switchGroupId), 0);
+  check("두 카테고리 잔액 복원", await getBalances(), balBeforeCross);
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log(
+    "\n--- 매수 카테고리에 남은 대금까지 다른 매입에 쓴 뒤 취소하면 거부 ---",
+  );
+  // 대금 120,000 중 100,000만 쓰고 남은 20,000 + 원래 50,000 = 70,000 을 다른 종목에 다 쓴다
+  const sw9 = await executeSwitch({
+    ...crossInput,
+    buy: { ...crossInput.buy, qty: 10 },
+  });
+  check("매수 뒤 자산성장 잔액", (await getBalances()).asset_growth, 70_000);
+  const spender9 = await addPurchase({
+    boughtAt: "2026-09-18",
+    category: "asset_growth",
+    ticker: "446720",
+    etfName: "합성 분산 ETF",
+    qty: 7,
+    unitPrice: 10_000,
+  });
+  const bal9 = await getBalances();
+  check("쓰고 난 자산성장 잔액 0원", bal9.asset_growth, 0);
+  const msg9 = await messageOf(() => cancelSwitch(sw9.switchGroupId));
+  check(
+    "거부 메시지(매수 카테고리 음수)",
+    msg9,
+    "취소하면 자산성장 잔액이 20,000원 음수가 됩니다. 먼저 다른 매입을 정리하세요",
+  );
+  const c9 = await counts(sw9.switchGroupId);
+  check("묶음 purchases 1행 그대로", c9.gp, 1);
+  check("묶음 sales 1행 그대로", c9.gs, 1);
+  check("묶음 원장 4행 그대로", await groupLedgerCount(sw9.switchGroupId), 4);
+  check("이전 행 2건 그대로", await switchMoveRowCount(), 2);
+  check("잔액 불변", await getBalances(), bal9);
+
+  console.log("\n--- 대조군: 쓴 매입을 정리하면 같은 취소가 통과한다 ---");
+  await deletePurchase(spender9.id);
+  check("예외 없음", await messageOf(() => cancelSwitch(sw9.switchGroupId)), null);
+  check("두 카테고리 잔액 복원", await getBalances(), balBeforeCross);
+  check("이전 행 0건", await switchMoveRowCount(), 0);
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log(
+    "\n=== 대조군: 매수 카테고리가 같거나 생략되면 이전 행이 생기지 않는다 ===",
+  );
+  await reset({ div_growth: 200_000, asset_growth: 50_000, high_div: 0 });
+  await seedDivHolding();
+  const same = await executeSwitch({
+    ...crossInput,
+    buyCategory: "div_growth",
+    buy: { ...crossInput.buy, qty: 12 },
+  });
+  check("같은 카테고리 명시: 매수 행은 배당성장", same.purchase.category, "div_growth");
+  check("같은 카테고리 명시: 이전 행 0건", await switchMoveRowCount(), 0);
+  check(
+    "같은 카테고리 명시: 묶음 원장 2행(sell + purchase)",
+    await groupLedgerCount(same.switchGroupId),
+    2,
+  );
+  const omitted = await executeSwitch({
+    category: "div_growth",
+    executedAt: "2026-09-17",
+    sell: { ticker: "251350", qty: 5, unitPrice: 12_000 },
+    buy: { ticker: "446720", etfName: "합성 분산 ETF", qty: 6, unitPrice: 10_000 },
+  });
+  check("생략: 매수 행은 매도 카테고리", omitted.purchase.category, "div_growth");
+  check("생략: 이전 행 0건", await switchMoveRowCount(), 0);
+  check(
+    "생략: 묶음 원장 2행(sell + purchase)",
+    await groupLedgerCount(omitted.switchGroupId),
+    2,
+  );
+  check("잔액: 자산성장은 그대로", await getBalances(), {
+    div_growth: 0,
+    asset_growth: 50_000,
+    high_div: 0,
+  });
+
+  console.log(
+    "\n=== 시나리오 10: 매수 카테고리 잔액+매도대금을 넘는 매수는 거부되고 매도도 남지 않는다 ===",
+  );
+  await reset({ div_growth: 200_000, asset_growth: 50_000, high_div: 0 });
+  await seedDivHolding();
+  const balBeforeOverCross = await getBalances();
+  const cBeforeOverCross = await counts();
+  const overCrossMsg = await messageOf(() =>
+    executeSwitch({ ...crossInput, buy: { ...crossInput.buy, qty: 18 } }),
+  );
+  check(
+    "거부 메시지는 매수 카테고리를 말한다",
+    overCrossMsg,
+    "자산성장 잔액+매도대금(170,000원)보다 큰 매수입니다 (매수 180,000원) — 수량을 줄이세요",
+  );
+  check("매도 행 0건(매수 실패로 매도도 롤백)", (await counts()).s, 0);
+  check("행 수 불변", await counts(), cBeforeOverCross);
+  check("이전 행 0건", await switchMoveRowCount(), 0);
+  check("잔액 불변", await getBalances(), balBeforeOverCross);
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log(
+    "\n--- 대조군: 매수 카테고리 잔액만으로는 모자라도 잔액+매도대금에 딱 맞으면 통과한다 ---",
+  );
+  check("자산성장 잔액만으로는 모자란 금액", 170_000 > balBeforeOverCross.asset_growth, true);
+  const exactCross = await executeSwitch({
+    ...crossInput,
+    buy: { ...crossInput.buy, qty: 17 },
+  });
+  check("매수 행은 자산성장", exactCross.purchase.category, "asset_growth");
+  check("잔액 전부 0원", await getBalances(), {
+    div_growth: 0,
+    asset_growth: 0,
+    high_div: 0,
+  });
+  check("이전 행 2건", await switchMoveRowCount(), 2);
+  check("묶음 원장 4행", await groupLedgerCount(exactCross.switchGroupId), 4);
+  check("고아 원장 0행", await orphanCount(), 0);
+
+  console.log(
+    "\n=== 시나리오 11: 카테고리를 넘은 갈아타기에서도 고배당 부족분 이전이 함께 동작한다 ===",
+  );
+  await reset({ div_growth: 200_000, asset_growth: 50_000, high_div: 100_000 });
+  await seedDivHolding();
+  const balHd = await getBalances();
+  // 200,000 = 자산성장 50,000 + 매도대금 120,000 + 고배당에서 30,000
+  const hdInput = { ...crossInput, buy: { ...crossInput.buy, qty: 20 } };
+  check(
+    "이전 허용 없이는 거부",
+    await messageOf(() => executeSwitch(hdInput)),
+    "자산성장 잔액+매도대금(170,000원)보다 큰 매수입니다 (매수 200,000원) — 수량을 줄이세요",
+  );
+  check("거부 후 잔액 불변", await getBalances(), balHd);
+  const sw11 = await executeSwitch({ ...hdInput, allowHighDivTransfer: true });
+  check("이전 후 잔액", await getBalances(), {
+    div_growth: 0,
+    asset_growth: 0,
+    high_div: 70_000,
+  });
+  check("고배당 이전 행 2건", await transferRowCount(), 2);
+  check("매도대금 이전 행 2건", await switchMoveRowCount(), 2);
+  const rows11 = await groupLedgerRows(sw11.switchGroupId);
+  check("묶음 원장 6행", rows11.length, 6);
+  check("여섯 행의 ts 가 모두 같다", new Set(rows11.map((r) => r.ts)).size, 1);
+  check("묶음 취소", await cancelSwitch(sw11.switchGroupId), {
+    purchases: 1,
+    sales: 1,
+  });
+  check("취소 후 세 카테고리 잔액 복원", await getBalances(), balHd);
+  check("취소 후 고배당 이전 행 0건", await transferRowCount(), 0);
+  check("취소 후 매도대금 이전 행 0건", await switchMoveRowCount(), 0);
   check("고아 원장 0행", await orphanCount(), 0);
 
   await db.execute(

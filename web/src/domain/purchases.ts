@@ -2,7 +2,8 @@ import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { ledger, purchases, recommendations, sales } from "@/db/schema";
 import { Category, CATEGORY_LABEL, dateKeyKST } from "./money";
-import { GrowthRole, toGrowthRole } from "./recommendation";
+import { getHoldingRoleOverrides } from "./ledger";
+import { GrowthRole, mergeHoldingRoles, toGrowthRole } from "./recommendation";
 
 /** db.transaction 콜백이 받는 트랜잭션 핸들 타입 — *Tx 코어 함수들이 공유한다. */
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -170,31 +171,35 @@ export function acceptBlockReason(
 /**
  * 보유 종목이 어느 자리(공격·안정)로 산 것인지. 키는 `카테고리::종목코드`.
  *
- * ③ 추천을 통해 기록된 매입만 자리를 안다 — 수기 매입은 빠지고, 그 종목은
- * 자리를 알 수 없는 것으로 다뤄야 한다(⑤가 임의로 통합 대상에 넣으면 안 된다).
- * 같은 종목을 여러 자리로 산 적이 있으면 가장 최근 매입의 자리를 쓴다.
+ * 먼저 ③ 추천을 통해 기록된 매입에서 자리를 거슬러 올라가고(같은 종목을 여러 자리로
+ * 산 적이 있으면 가장 최근 매입의 자리), 그 위에 사람이 직접 지정한 자리
+ * (settings.holding_roles — 설정 화면·매입/갈아타기 폼)를 덮는다.
+ * 둘 다 없는 종목은 자리를 알 수 없는 것으로 다뤄야 한다(⑤가 임의로 통합 대상에 넣으면 안 된다).
  */
 export async function holdingRoles(): Promise<Map<string, GrowthRole>> {
-  const rows = await db
-    .select({
-      category: purchases.category,
-      ticker: purchases.ticker,
-      role: recommendations.role,
-    })
-    .from(purchases)
-    .innerJoin(
-      recommendations,
-      eq(purchases.recommendationId, recommendations.id),
-    )
-    .where(isNotNull(recommendations.role))
-    .orderBy(purchases.boughtAt, purchases.id);
+  const [rows, overrides] = await Promise.all([
+    db
+      .select({
+        category: purchases.category,
+        ticker: purchases.ticker,
+        role: recommendations.role,
+      })
+      .from(purchases)
+      .innerJoin(
+        recommendations,
+        eq(purchases.recommendationId, recommendations.id),
+      )
+      .where(isNotNull(recommendations.role))
+      .orderBy(purchases.boughtAt, purchases.id),
+    getHoldingRoleOverrides(),
+  ]);
 
-  const out = new Map<string, GrowthRole>();
+  const derived = new Map<string, GrowthRole>();
   for (const r of rows) {
     const role = toGrowthRole(r.role);
-    if (role) out.set(`${r.category}::${r.ticker}`, role);
+    if (role) derived.set(`${r.category}::${r.ticker}`, role);
   }
-  return out;
+  return mergeHoldingRoles(derived, overrides);
 }
 
 /** 이미 매입으로 기록된 추천 id — 추천 화면에서 확정 폼 대신 완료 표시를 띄운다 */
@@ -342,6 +347,8 @@ export async function deletePurchase(id: number) {
  * 갈아타기 묶음 취소 — 같은 switchGroupId 의 매수·매도와 그 원장 행을 한 트랜잭션에서 지운다.
  *
  * 잔액은 원장 SUM 파생이므로 행을 지우면 실행 전 값으로 그대로 돌아간다.
+ * 카테고리를 넘은 갈아타기의 매도대금 이전(adjust 쌍)도 refPurchaseId 로 매입에 달려 있어
+ * 함께 지워지고, 잔액 음수 확인은 매도·매수 두 카테고리 모두에 적용된다.
  * 다만 매수분을 되돌리면 보유가 줄어드는데, 그 뒤 같은 종목을 또 팔았다면 보유가
  * 음수가 되므로 그 경우에는 거부한다.
  */
@@ -550,7 +557,9 @@ export type SwitchLeg = {
 };
 
 export type SwitchInput = {
-  category: Category; // 매도·매수 모두 같은 카테고리(예산) 안에서 교체한다
+  category: Category; // 매도 카테고리 — 매도대금이 먼저 환입되는 곳
+  // 매수 카테고리 (기본 = category). 다르면 매도대금 전액을 이 카테고리로 옮긴 뒤 산다
+  buyCategory?: Category;
   executedAt?: string; // YYYY-MM-DD, 매도·매수 같은 날 (기본 오늘 KST)
   sell: SwitchLeg;
   buy: SwitchLeg & { etfName: string }; // 새로 살 종목 이름은 필수
@@ -560,10 +569,12 @@ export type SwitchInput = {
 };
 
 /**
- * 갈아타기 실행: 같은 카테고리에서 A 매도 → B 매수를 한 트랜잭션·한 switchGroupId 로 묶는다.
+ * 갈아타기 실행: A 매도 → B 매수를 한 트랜잭션·한 switchGroupId 로 묶는다.
  *
  * - 원자성: 매도가 실패(보유 부족 등)하거나 매수가 실패하면 둘 다 롤백된다. "팔았는데 못 삼"이 없다.
- * - 재원: 매도대금이 sell(+) 원장 행으로 카테고리 잔액에 환입돼 그대로 매수 재원이 된다.
+ * - 재원: 매도대금이 sell(+) 원장 행으로 매도 카테고리 잔액에 환입돼 매수 재원이 된다.
+ *   매수 카테고리가 다르면 매도대금 전액을 adjust 쌍(−/+)으로 매수 카테고리에 옮긴다 —
+ *   매수에 쓰고 남은 돈도 매수 카테고리에 남는다.
  * - 추적: sales·purchases 두 행이 같은 switchGroupId 를 가져 한 번의 교체로 묶인다.
  */
 export async function executeSwitch(input: SwitchInput) {
@@ -572,6 +583,7 @@ export async function executeSwitch(input: SwitchInput) {
   }
   const date = input.executedAt ?? dateKeyKST();
   const switchGroupId = `sw-${Date.now()}`;
+  const buyCategory = input.buyCategory ?? input.category;
 
   return db.transaction(async (tx) => {
     const sale = await addSaleTx(tx, {
@@ -586,11 +598,35 @@ export async function executeSwitch(input: SwitchInput) {
       memo: input.memo ?? "갈아타기 매도",
     });
 
+    // 매도대금 이전은 매입보다 먼저 넣는다 — 매수 잔액 검증이 옮겨 온 돈까지 세야 하기 때문.
+    // 매입 id 는 아직 없으므로 매입 뒤에 refPurchaseId 를 채운다(취소가 매입과 함께 지운다).
+    // 같은 트랜잭션이라 ts(now())가 같아 성과 집계에서 −/+ 가 상쇄된다 — 외부 유입이 아니다.
+    const moved =
+      buyCategory === input.category
+        ? []
+        : await tx
+            .insert(ledger)
+            .values([
+              {
+                type: "adjust" as const,
+                category: input.category,
+                amountKrw: -sale.amountKrw,
+                memo: `갈아타기 매도대금 → ${CATEGORY_LABEL[buyCategory]} 이전`,
+              },
+              {
+                type: "adjust" as const,
+                category: buyCategory,
+                amountKrw: sale.amountKrw,
+                memo: `${CATEGORY_LABEL[input.category]} 갈아타기 매도대금 이전받음`,
+              },
+            ])
+            .returning({ id: ledger.id });
+
     const purchase = await addPurchaseWithTransferTx(
       tx,
       {
         boughtAt: date,
-        category: input.category,
+        category: buyCategory,
         ticker: input.buy.ticker,
         etfName: input.buy.etfName,
         qty: input.buy.qty,
@@ -602,9 +638,16 @@ export async function executeSwitch(input: SwitchInput) {
       {
         allowTransfer: input.allowHighDivTransfer ?? false,
         overMessage: (available, amount) =>
-          `${CATEGORY_LABEL[input.category]} 잔액+매도대금(${available.toLocaleString("ko-KR")}원)보다 큰 매수입니다 (매수 ${amount.toLocaleString("ko-KR")}원) — 수량을 줄이세요`,
+          `${CATEGORY_LABEL[buyCategory]} 잔액+매도대금(${available.toLocaleString("ko-KR")}원)보다 큰 매수입니다 (매수 ${amount.toLocaleString("ko-KR")}원) — 수량을 줄이세요`,
       },
     );
+
+    if (moved.length) {
+      await tx
+        .update(ledger)
+        .set({ refPurchaseId: purchase.id })
+        .where(inArray(ledger.id, moved.map((r) => r.id)));
+    }
 
     return { switchGroupId, sale, purchase };
   });

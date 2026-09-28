@@ -20,7 +20,11 @@ import {
   runLazyTopup,
   seedInitialBalances,
 } from "../src/domain/ledger";
-import { addPurchaseWithHighDivTransfer } from "../src/domain/purchases";
+import {
+  addPurchase,
+  addPurchaseWithHighDivTransfer,
+  executeSwitch,
+} from "../src/domain/purchases";
 import { getPerformance } from "../src/domain/performance";
 import { Category } from "../src/domain/money";
 import { guardAgainstRealData } from "./lib/guard";
@@ -160,6 +164,95 @@ async function main() {
     category: "div_growth",
   });
   check("배당성장 납입액 = 35만 − 10만", grownAfter.paidIn, 250_000);
+
+  console.log(
+    "\n=== 시나리오 F: 매수 카테고리를 바꾼 갈아타기의 매도대금 이전은 외부 유입이 아니다 ===",
+  );
+  // 종목·금액은 전부 합성 값이다
+  await reset();
+  await seedInitialBalances(
+    { div_growth: 0, asset_growth: 0, high_div: 0 },
+    new Date("2026-08-27T01:00:00Z"),
+  );
+  await runLazyTopup(new Date("2026-09-01T05:00:00Z")); // 35만/21만/14만
+  await addPurchase({
+    boughtAt: "2026-09-02",
+    category: "div_growth",
+    ticker: "251350",
+    etfName: "합성 배당 ETF",
+    qty: 30,
+    unitPrice: 10_000,
+  });
+  // 배당성장 10주 매도(대금 12만) → 자산성장 20만어치 매수
+  await executeSwitch({
+    category: "div_growth",
+    buyCategory: "asset_growth",
+    executedAt: "2026-09-16",
+    sell: { ticker: "251350", qty: 10, unitPrice: 12_000 },
+    buy: { ticker: "133690", etfName: "합성 성장 ETF", qty: 20, unitPrice: 10_000 },
+  });
+  check("갈아타기 후 잔액", await getBalances(), {
+    div_growth: 50_000 + 120_000 - 120_000,
+    asset_growth: 210_000 + 120_000 - 200_000,
+    high_div: 140_000,
+  });
+  const crossAll = await getPerformance({
+    marketValue: 400_000,
+    cashBalance: 320_000,
+    partial: false,
+  });
+  check("포트폴리오 납입액 = 충전액만", crossAll.paidIn, 700_000);
+  check("대조군(양수만)은 이전분만큼 부푼다", await legacyPaidIn(), 820_000);
+  const crossDiv = await getPerformance({
+    marketValue: 240_000,
+    cashBalance: 50_000,
+    partial: false,
+    category: "div_growth",
+  });
+  check("배당성장 납입액 = 35만 − 이전 12만", crossDiv.paidIn, 230_000);
+  const crossAsset = await getPerformance({
+    marketValue: 200_000,
+    cashBalance: 130_000,
+    partial: false,
+    category: "asset_growth",
+  });
+  check("자산성장 납입액 = 21만 + 이전 12만", crossAsset.paidIn, 330_000);
+
+  console.log("\n--- 대조군: 같은 카테고리 갈아타기는 이전 행 없이 납입액이 그대로다 ---");
+  await reset();
+  await seedInitialBalances(
+    { div_growth: 0, asset_growth: 0, high_div: 0 },
+    new Date("2026-08-27T01:00:00Z"),
+  );
+  await runLazyTopup(new Date("2026-09-01T05:00:00Z"));
+  await addPurchase({
+    boughtAt: "2026-09-02",
+    category: "div_growth",
+    ticker: "251350",
+    etfName: "합성 배당 ETF",
+    qty: 30,
+    unitPrice: 10_000,
+  });
+  await executeSwitch({
+    category: "div_growth",
+    executedAt: "2026-09-16",
+    sell: { ticker: "251350", qty: 10, unitPrice: 12_000 },
+    buy: { ticker: "446720", etfName: "합성 분산 ETF", qty: 12, unitPrice: 10_000 },
+  });
+  const sameAll = await getPerformance({
+    marketValue: 360_000,
+    cashBalance: 400_000,
+    partial: false,
+  });
+  check("포트폴리오 납입액 = 충전액만", sameAll.paidIn, 700_000);
+  check("대조군(양수만)도 같은 값 — 이전 행이 없다", await legacyPaidIn(), 700_000);
+  const sameDiv = await getPerformance({
+    marketValue: 360_000,
+    cashBalance: 50_000,
+    partial: false,
+    category: "div_growth",
+  });
+  check("배당성장 납입액 = 35만 그대로", sameDiv.paidIn, 350_000);
 
   await reset();
   console.log(
